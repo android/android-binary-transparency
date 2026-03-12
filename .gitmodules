@@ -1,0 +1,3 @@
+[submodule "avb"]
+	path = avb
+	url = https://android.googlesource.com/platform/external/avb/
