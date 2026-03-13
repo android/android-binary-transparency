@@ -25,7 +25,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,6 +41,8 @@ const (
 	originIDPixel = "developers.google.com/android/binary_transparency/0\n"
 	// originIDG1P identifies a checkpoint for the Google System APK Transparency Log.
 	originIDG1P = "developers.google.com/android/binary_transparency/google1p/0\n"
+	// originIDG1PAPK identifies a checkpoint for the Google 1P APK Transparency Log.
+	originIDG1PAPK = "gstatic.com/android/binary_transparency/google1p/apk/2026/0\n"
 )
 
 type verifier interface {
@@ -111,18 +112,21 @@ type Root struct {
 func parseCheckpoint(ckpt string) (Root, error) {
 	var body string
 	// Strip the origin ID and parse the rest of the checkpoint.
-	if strings.HasPrefix(ckpt, originIDPixel) {
+	switch {
+	case strings.HasPrefix(ckpt, originIDPixel):
 		body = ckpt[len(originIDPixel):]
-	} else if strings.HasPrefix(ckpt, originIDG1P) {
+	case strings.HasPrefix(ckpt, originIDG1P):
 		body = ckpt[len(originIDG1P):]
-	} else {
-		return Root{}, errors.New(fmt.Sprintf("invalid checkpoint - unknown origin, must be either %s or %s", originIDPixel, originIDG1P))
+	case strings.HasPrefix(ckpt, originIDG1PAPK):
+		body = ckpt[len(originIDG1PAPK):]
+	default:
+		return Root{}, fmt.Errorf("invalid checkpoint - unknown origin, must be either %s, %s, or %s", originIDPixel, originIDG1P, originIDG1PAPK)
 	}
 
 	// body must contain exactly 2 lines, size and the root hash.
 	l := strings.SplitN(body, "\n", 3)
 	if len(l) != 3 || len(l[2]) != 0 {
-		return Root{}, errors.New("invalid checkpoint - bad format: must have origin id, size and root hash each followed by newline")
+		return Root{}, fmt.Errorf("invalid checkpoint - bad format: must have origin id, size and root hash each followed by newline")
 	}
 	size, err := strconv.ParseUint(l[0], 10, 64)
 	if err != nil {

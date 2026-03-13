@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
@@ -17,7 +18,9 @@ import (
 // HashReader implements tlog.HashReader, reading from tlog-based log located at
 // URL.
 type HashReader struct {
-	URL string
+	URL        string
+	TileHeight int
+	TreeSize   int64
 }
 
 // Domain separation prefix for Merkle tree hashing with second preimage
@@ -29,28 +32,63 @@ const (
 // ReadHashes implements tlog.HashReader's ReadHashes.
 // See: https://pkg.go.dev/golang.org/x/mod/sumdb/tlog#HashReader.
 func (h HashReader) ReadHashes(indices []int64) ([]tlog.Hash, error) {
-	tiles := make(map[string][]byte)
+	tiles := make(map[string][]byte) // cache tile path -> content
 	hashes := make([]tlog.Hash, 0, len(indices))
 	for _, index := range indices {
-		// The PixelBT log is tiled at height = 1.
-		tile := tlog.TileForIndex(1, index)
+		// A tlog index is a pointer to a hash at a given level in the tree.
+		// SplitStoredHashIndex returns the level and offset n for this index.
+		level, n := tlog.SplitStoredHashIndex(index)
 
-		var content []byte
-		var exists bool
-		var err error
-		content, exists = tiles[tile.Path()]
-		if !exists {
-			content, err = readFromURL(h.URL, tile.Path())
-			if err != nil {
-				return nil, fmt.Errorf("failed to read from %s: %v", tile.Path(), err)
+		// The tile metadata is calculated here.
+		// See https://pkg.go.dev/golang.org/x/mod/sumdb/tlog#Tile for explanations
+		// of H, L, N, and W.
+		tile := tlog.Tile{H: h.TileHeight}
+		// A tile of height H covers levels [L*H, (L+1)*H).
+		// tile.L is the tile level which contains nodes at level `level`.
+		tile.L = level / h.TileHeight
+		// levelInTile is level of node `n` within its tile level L.
+		levelInTile := level % h.TileHeight
+		// tile.N is node index in tile level L.
+		tile.N = n << uint(levelInTile) >> uint(h.TileHeight)
+		// tile.W is tile width, initialized to maximum width.
+		tile.W = 1 << uint(h.TileHeight)
+
+		// Partial tile check based on tlog's tileParent logic
+		// A tile might be partial if it's on the right edge of tree.
+		// If tile extends beyond TreeSize, reduce tile.W to TreeSize limit.
+		max := h.TreeSize >> uint(tile.L*h.TileHeight)
+		if tile.N<<uint(h.TileHeight)+int64(tile.W) > max {
+			if tile.N<<uint(h.TileHeight) >= max {
+				tile.W = 0
+			} else {
+				tile.W = int(max - tile.N<<uint(h.TileHeight))
 			}
-			tiles[tile.Path()] = content
 		}
 
+		if tile.W == 0 {
+			hashes = append(hashes, tlog.Hash{})
+			continue
+		}
+
+		pathForLookup := tile.Path()
+		content, exists := tiles[pathForLookup]
+		var err error
+
+		if !exists {
+			// If tile is not in cache, read it from URL.
+			content, err = readFromURL(h.URL, pathForLookup)
+			if err != nil {
+				return nil, fmt.Errorf("tile fetch error for index %d: %v", index, err)
+			}
+			tiles[pathForLookup] = content
+		}
+
+		// Extract hash for `index` from downloaded tile content.
 		hash, err := tlog.HashFromTile(tile, content, index)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read data from tile for index %d: %v", index, err)
 		}
+		slog.Debug("Extracted hash", "index", fmt.Sprintf("%x", index), "hash", fmt.Sprintf("%x", hash))
 		hashes = append(hashes, hash)
 	}
 	return hashes, nil

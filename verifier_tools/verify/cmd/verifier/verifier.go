@@ -22,7 +22,7 @@ package main
 import (
 	"bytes"
 	"flag"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -36,13 +36,15 @@ import (
 // Domain separation prefix for Merkle tree hashing with second preimage
 // resistance similar to that used in RFC 6962.
 const (
-	LeafHashPrefix          = 0
-	KeyNameForVerifierPixel = "pixel_transparency_log"
-	KeyNameForVerifierG1P   = "developers.google.com/android/binary_transparency/google1p/0"
-	LogBaseURLPixel         = "https://developers.google.com/android/binary_transparency"
-	LogBaseURLG1P           = "https://developers.google.com/android/binary_transparency/google1p"
-	ImageInfoFilename       = "image_info.txt"
-	PackageInfoFilename     = "package_info.txt"
+	LeafHashPrefix           = 0
+	KeyNameForVerifierPixel  = "pixel_transparency_log"
+	KeyNameForVerifierG1PJWT = "developers.google.com/android/binary_transparency/google1p/0"
+	KeyNameForVerifierG1PAPK = "gstatic.com/android/binary_transparency/google1p/apk/2026/0"
+	LogBaseURLPixel          = "https://developers.google.com/android/binary_transparency"
+	LogBaseURLG1PJWT         = "https://developers.google.com/android/binary_transparency/google1p"
+	LogBaseURLG1PAPK         = "https://www.gstatic.com/android/binary_transparency/google1p/apk/2026/01/"
+	ImageInfoFilename        = "image_info.txt"
+	PackageInfoFilename      = "package_info.txt"
 )
 
 // See https://developers.google.com/android/binary_transparency/pixel_tech_details#log_implementation.
@@ -55,84 +57,109 @@ var pixelLogPubKey []byte
 //go:embed log_pub_key.google_system_apk.pem
 var googleSystemAppLogPubKey []byte
 
+//go:embed log_pub_key.google_apk.pem
+var googleAPKLogPubKey []byte
+
 var (
 	payloadPath = flag.String("payload_path", "", "Path to the payload describing the binary of interest.")
-	logType     = flag.String("log_type", "", "Which log: 'pixel' or 'google_system_apk'.")
+	logType     = flag.String("log_type", "", "Which log: 'pixel' or 'google_1p_code' or 'google_1p_apk'.")
 )
 
 func main() {
 	flag.Parse()
 
 	if *payloadPath == "" {
-		log.Fatal("must specify the payload_path for the image payload")
+		slog.Error("must specify the payload_path for the binary payload")
+		os.Exit(1)
 	}
 	b, err := os.ReadFile(*payloadPath)
 	if err != nil {
-		log.Fatalf("unable to open file %q: %v", *payloadPath, err)
+		slog.Error("unable to open file", "path", *payloadPath, "error", err)
+		os.Exit(1)
 	}
 	// Payload should not contain excessive leading or trailing whitespace.
 	payloadBytes := bytes.TrimSpace(b)
 	payloadBytes = append(payloadBytes, '\n')
 	if string(b) != string(payloadBytes) {
-		log.Printf("Reformatted payload content from %q to %q", b, payloadBytes)
+		slog.Info("Reformatted payload content", "from", b, "to", payloadBytes)
 	}
 
 	var logPubKey []byte
 	var logBaseURL string
 	var keyNameForVerifier string
 	var binaryInfoFilename string
-	if *logType == "" {
-		log.Fatal("must specify which log to verify against: 'pixel' or 'google_system_apk'")
-	} else if *logType == "pixel" {
+	var tileHeight int
+	switch *logType {
+	case "":
+		slog.Error("must specify which log to verify against: 'pixel' or 'google_1p_code' or 'google_1p_apk'")
+		os.Exit(1)
+	case "pixel":
 		logPubKey = pixelLogPubKey
 		logBaseURL = LogBaseURLPixel
 		keyNameForVerifier = KeyNameForVerifierPixel
 		binaryInfoFilename = ImageInfoFilename
-	} else if *logType == "google_system_apk" {
+		tileHeight = 1
+	case "google_1p_code":
 		logPubKey = googleSystemAppLogPubKey
-		logBaseURL = LogBaseURLG1P
-		keyNameForVerifier = KeyNameForVerifierG1P
+		logBaseURL = LogBaseURLG1PJWT
+		keyNameForVerifier = KeyNameForVerifierG1PJWT
 		binaryInfoFilename = PackageInfoFilename
-	} else {
-		log.Fatal("unsupported log type")
+		tileHeight = 1
+	case "google_1p_apk":
+		logPubKey = googleAPKLogPubKey
+		logBaseURL = LogBaseURLG1PAPK
+		keyNameForVerifier = KeyNameForVerifierG1PAPK
+		binaryInfoFilename = PackageInfoFilename
+		tileHeight = 8
+	default:
+		slog.Error("unsupported log type")
+		os.Exit(1)
 	}
 
 	v, err := checkpoint.NewVerifier(logPubKey, keyNameForVerifier)
 	if err != nil {
-		log.Fatalf("error creating verifier: %v", err)
+		slog.Error("error creating verifier", "error", err)
+		os.Exit(1)
 	}
 	root, err := checkpoint.FromURL(logBaseURL, v)
 	if err != nil {
-		log.Fatalf("error reading checkpoint for log(%s): %v", logBaseURL, err)
+		slog.Error("error reading checkpoint", "log", logBaseURL, "error", err)
+		os.Exit(1)
 	}
 
 	m, err := tiles.BinaryInfosIndex(logBaseURL, binaryInfoFilename)
 	if err != nil {
-		log.Fatalf("failed to load binary info map to find log index: %v", err)
+		slog.Error("failed to load binary info map to find log index", "error", err)
+		os.Exit(1)
 	}
 	binaryInfoIndex, ok := m[string(payloadBytes)]
 	if !ok {
-		log.Fatalf("failed to find payload %q in %s", string(payloadBytes), filepath.Join(logBaseURL, binaryInfoFilename))
+		slog.Error("failed to find payload", "payload", string(payloadBytes), "file", filepath.Join(logBaseURL, binaryInfoFilename))
+		os.Exit(1)
 	}
 
 	var th tlog.Hash
 	copy(th[:], root.Hash)
 
 	logSize := int64(root.Size)
-	r := tiles.HashReader{URL: logBaseURL}
+	r := tiles.HashReader{URL: logBaseURL, TileHeight: tileHeight, TreeSize: logSize}
+	slog.Debug("tlog.ProveRecord", "logSize", logSize, "binaryInfoIndex", binaryInfoIndex)
 	rp, err := tlog.ProveRecord(logSize, binaryInfoIndex, r)
 	if err != nil {
-		log.Fatalf("error in tlog.ProveRecord: %v", err)
+		slog.Error("error in tlog.ProveRecord", "error", err)
+		os.Exit(1)
 	}
 
 	leafHash, err := tiles.PayloadHash(payloadBytes)
 	if err != nil {
-		log.Fatalf("error hashing payload: %v", err)
+		slog.Error("error hashing payload", "error", err)
+		os.Exit(1)
 	}
 
 	if err := tlog.CheckRecord(rp, logSize, th, binaryInfoIndex, leafHash); err != nil {
-		log.Fatalf("FAILURE: inclusion check error in tlog.CheckRecord: %v", err)
+		slog.Error("FAILURE: inclusion check error in tlog.CheckRecord", "error", err)
+		os.Exit(1)
 	} else {
-		log.Print("OK. inclusion check success!")
+		slog.Info("OK. inclusion check success!")
 	}
 }
