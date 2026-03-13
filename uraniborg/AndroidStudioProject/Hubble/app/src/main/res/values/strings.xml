@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Hubble</string>
+    <string name="app_description">An app that queries the system and collects data about
+        preloaded apps on the system, and also about APK signing information, permissions,
+        and other device info.</string>
+    <string name="scan_start">Scanning...</string>
+    <string name="scan_end">Scan complete</string>
+</resources>
