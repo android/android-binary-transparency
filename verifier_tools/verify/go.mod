@@ -1,4 +1,4 @@
-module android.googlesource.com/platform/external/avb.git/tools/transparency/verify
+module github.com/android/android-binary-transparency/verifier_tools/verify
 
 go 1.17
 
