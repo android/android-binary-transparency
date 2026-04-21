@@ -31,6 +31,7 @@ import tarfile  # to untar decompressed adb backup file
 from typing import Optional  # runtime support for type hints.
 import zlib  # to decompress adb backup
 
+import inclusion_proof_check
 import syscall_wrapper
 
 AdbWrapper = syscall_wrapper.AdbWrapper
@@ -76,7 +77,19 @@ def parse_arguments() -> argparse.Namespace:
                            "APKs from the device. The resulting APKs will be "
                            "stored in an \"apks\" directory within the "
                            "specific numbered results directory.")
+  parser.add_argument("--perform_inclusion_proof_check", required=False,
+                      action="store_true",
+                      help="If specified, after pulling results, perform "
+                           "inclusion proof check for each package APK split "
+                           "and write results to "
+                           "packages_with_inclusion_proof_signal.txt.")
+  parser.add_argument("--verifier_path", required=False,
+                      help="Path to verifier executable, used if "
+                           "--perform_inclusion_proof_check is specified.")
   args = parser.parse_args()
+
+  if args.perform_inclusion_proof_check and args.verifier_path is None:
+    parser.error("--verifier_path is required when --perform_inclusion_proof_check is specified.")
   return args
 
 
@@ -584,6 +597,8 @@ def classify_dir_using_build_fingerprint(
       logger.debug("{} does not exist yet! Using it!".format(target_dir))
       break
 
+  os.makedirs(target_dir, exist_ok=True)
+
   apks_dir = ""
   if extract_apks:
     apks_dir = os.path.abspath(os.path.join(target_dir, "apks"))
@@ -803,9 +818,15 @@ def main():
     if not results_dir:
       logger.error("Failed to extract results from target device (%s).",
                    target_device.serial_number)
+      continue
 
     extract_selinux_policies(adb_wrapper, results_dir, logger)
     results[target_device.serial_number] = results_dir
+
+    if args.perform_inclusion_proof_check:
+      packages_txt_path = os.path.join(results_dir, "results", "packages.txt")
+      inclusion_proof_check.perform_inclusion_proof_check(
+          args.verifier_path, packages_txt_path, logger)
 
   for device in results:
     logger.info("SUCCESS! Hubble was successfully deployed and executed on "

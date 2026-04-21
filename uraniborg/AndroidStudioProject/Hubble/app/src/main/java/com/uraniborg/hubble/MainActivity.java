@@ -49,7 +49,7 @@ public class MainActivity extends AppCompatActivity {
   // semantically tie the notion of app version to versionName, which we will update for every
   // major and minor release. Unfortunately, for now, we have to independently and separately
   // update these values everytime we do any revisions because BuildConfig is phased out.
-  private final String VERSION = "2.0.0";
+  private final String VERSION = "2.0.1";
 
   // We're changing to TreeMap so that package names are sorted. This would ease output comparison.
   private TreeMap<String, PackageMetadata> mAllPackages;

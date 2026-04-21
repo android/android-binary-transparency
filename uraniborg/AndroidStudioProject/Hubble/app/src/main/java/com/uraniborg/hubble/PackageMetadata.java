@@ -72,7 +72,7 @@ public class PackageMetadata extends BaseInfo {
   protected long firstInstallTime;
   protected String sharedUserId;
   protected int sharedUserLabel;
-  protected String[] splitNames;
+  protected JSONArray splits;
   protected int[] kernelGids;
   protected long fileSizeInBytes;
 
@@ -130,7 +130,24 @@ public class PackageMetadata extends BaseInfo {
     result.firstInstallTime = packageInfo.firstInstallTime;
     result.sharedUserId = packageInfo.sharedUserId;
     result.sharedUserLabel = packageInfo.sharedUserLabel;
-    result.splitNames = packageInfo.splitNames;
+
+    if (packageInfo.splitNames != null && packageInfo.applicationInfo != null && packageInfo.applicationInfo.splitSourceDirs != null) {
+      result.splits = new JSONArray();
+      for (int i = 0; i < packageInfo.splitNames.length; i++) {
+        if (i < packageInfo.applicationInfo.splitSourceDirs.length) {
+          JSONObject splitObj = new JSONObject();
+          try {
+            splitObj.put("name", packageInfo.splitNames[i]);
+            splitObj.put("location", packageInfo.applicationInfo.splitSourceDirs[i]);
+            splitObj.put("hash", Utilities.computeSHA256DigestOfFile(context, packageInfo.applicationInfo.splitSourceDirs[i]));
+            result.splits.put(splitObj);
+          } catch (JSONException e) {
+            Log.e("PackageMetadata", "Failed to add split info", e);
+          }
+        }
+      }
+    }
+
     result.kernelGids = packageInfo.gids;
 
     // compute package size
