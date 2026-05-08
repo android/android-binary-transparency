@@ -58,9 +58,9 @@ def parse_arguments() -> argparse.Namespace:
       formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
   parser.add_argument("-H", "--hubble", required=False,
-                      default="../../prebuilts/APK/latest",
+                      default=None,
                       help="The path to where Hubble APK is on your "
-                      "system/host.")
+                      "system/host. If not specified, Hubble will be rebuilt.")
   parser.add_argument("-o", "--output", required=False,
                       default=os.path.join(os.getcwd(), "results"),
                       help="Specifies the output directory where the "
@@ -743,6 +743,45 @@ def main():
   if not supported_platform(logger):
     logger.error("Sorry, your OS is currently unsupported for this script.")
     return
+
+  if args.hubble is None:
+    logger.info("-H flag not used. Rebuilding Hubble...")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    hubble_project_dir = os.path.abspath(os.path.join(script_dir, "../../AndroidStudioProject/Hubble"))
+    gradlew_path = os.path.join(hubble_project_dir, "gradlew")
+
+    logger.info("Running 'gradlew assemble' in %s", hubble_project_dir)
+    sw = SyscallWrapper(logger)
+    sw.call_returnable_command([gradlew_path, "assemble"], cwd=hubble_project_dir)
+    if sw.error_occured:
+      logger.error("Failed to (re)build Hubble APK!")
+      logger.error("Command failed with exit code %d", sw.return_code)
+      logger.error("Error message:\n%s", sw.error_message)
+      logger.error("Please check for missing dependencies or other build errors.")
+      return
+
+    for line in sw.result_final:
+      logger.debug("Gradle output: %s", line)
+
+    latest_symlink_path = os.path.abspath(os.path.join(script_dir, "../../prebuilts/APK/latest"))
+    if os.path.exists(latest_symlink_path) or os.path.islink(latest_symlink_path):
+      logger.debug("Removing old symlink: %s", latest_symlink_path)
+      try:
+        os.remove(latest_symlink_path)
+      except Exception as e:
+        logger.error("Failed to remove old symlink %s: %s", latest_symlink_path, e)
+        return
+
+    symlink_target = "../../AndroidStudioProject/Hubble/app/build/outputs/apk/debug/app-debug.apk"
+
+    logger.info("Creating new symlink 'latest' -> %s", symlink_target)
+    try:
+      os.symlink(symlink_target, latest_symlink_path)
+    except Exception as e:
+      logger.error("Failed to create symlink %s: %s", latest_symlink_path, e)
+      return
+
+    args.hubble = latest_symlink_path
 
   if not verify_hubble(args, logger):
     return

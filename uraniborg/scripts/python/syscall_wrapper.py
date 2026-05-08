@@ -59,13 +59,14 @@ class SyscallWrapper:
     while cmd_pid.poll() is None:
       pass
 
-  def call_returnable_command(self, cmd):
+  def call_returnable_command(self, cmd, cwd=None):
     """Handles the type of calls that returns.
 
     For these type of calls, we can just pull the results when the call ends.
 
     Args:
       cmd: The command to be executed.
+      cwd: The directory in which to execute the command.
     """
     self.reset()
     logger = self._logger
@@ -73,7 +74,7 @@ class SyscallWrapper:
     self.last_command = cmd
 
     cmd_pid = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
     while True:
       self.return_code = cmd_pid.poll()
       try:
