@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-# Copyright 2020 Uraniborg authors.
+# Copyright 2026 Uraniborg authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -736,6 +736,68 @@ def extract_selinux_policies(adb_wrapper: syscall_wrapper.AdbWrapper,
         logger.warning("Failed to pull %s. Continuing...", source_location)
 
 
+def ensure_android_sdk(hubble_project_dir: str, logger: logging.Logger) -> bool:
+  """Ensures that Android SDK location is set for Gradle.
+
+  Args:
+    hubble_project_dir: Path to the Hubble Android project directory.
+    logger: A logger object to log debug or error messages.
+
+  Returns:
+    True if SDK location is set and valid, False otherwise.
+  """
+  if os.environ.get("ANDROID_HOME"):
+    logger.debug("ANDROID_HOME is set to %s", os.environ.get("ANDROID_HOME"))
+    return True
+  if os.environ.get("ANDROID_SDK_ROOT"):
+    logger.debug("ANDROID_SDK_ROOT is set to %s", os.environ.get("ANDROID_SDK_ROOT"))
+    return True
+
+  local_props_path = os.path.join(hubble_project_dir, "local.properties")
+  if os.path.exists(local_props_path):
+    with open(local_props_path, "r") as f:
+      for line in f:
+        if line.startswith("sdk.dir="):
+          sdk_dir = line.split("=")[1].strip()
+          logger.debug("Found sdk.dir in local.properties: %s", sdk_dir)
+          if os.path.exists(sdk_dir):
+            return True
+          else:
+            logger.warning("sdk.dir in local.properties points to non-existent directory: %s", sdk_dir)
+
+  default_locations = []
+  if sys.platform == "darwin":
+    default_locations.append(os.path.expanduser("~/Library/Android/sdk"))
+  elif sys.platform == "linux":
+    default_locations.append(os.path.expanduser("~/Android/Sdk"))
+
+  sdk_path = None
+  for loc in default_locations:
+    if os.path.exists(loc):
+      logger.info("Auto-detected Android SDK at %s", loc)
+      sdk_path = loc
+      break
+
+  if not sdk_path:
+    logger.error("Android SDK location not found in environment or default locations.")
+    logger.error("Please set the ANDROID_HOME environment variable to point to your Android SDK installation.")
+    return False
+
+  logger.info("Writing sdk.dir to %s", local_props_path)
+  lines = []
+  if os.path.exists(local_props_path):
+    with open(local_props_path, "r") as f:
+      lines = f.read().splitlines()
+
+  lines = [l for l in lines if not l.strip().startswith("sdk.dir=")]
+  lines.append(f"sdk.dir={sdk_path}")
+
+  with open(local_props_path, "w") as f:
+    f.write("\n".join(lines) + "\n")
+
+  return True
+
+
 def main():
   args = parse_arguments()
   logger = set_up_logging(args)
@@ -748,22 +810,23 @@ def main():
     logger.info("-H flag not used. Rebuilding Hubble...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     hubble_project_dir = os.path.abspath(os.path.join(script_dir, "../../AndroidStudioProject/Hubble"))
+    if not ensure_android_sdk(hubble_project_dir, logger):
+      logger.error("Failed to (re)build Hubble APK: Android SDK not found.")
+      return
     gradlew_path = os.path.join(hubble_project_dir, "gradlew")
 
     logger.info("Running 'gradlew assemble' in %s", hubble_project_dir)
     sw = SyscallWrapper(logger)
     sw.call_returnable_command([gradlew_path, "assemble"], cwd=hubble_project_dir)
     if sw.error_occured:
-      logger.error("Failed to (re)build Hubble APK!")
-      logger.error("Command failed with exit code %d", sw.return_code)
-      logger.error("Error message:\n%s", sw.error_message)
-      logger.error("Please check for missing dependencies or other build errors.")
+      logger.error("Failed to (re)build Hubble APK: [%d] %s", sw.return_code, sw.error_message)
       return
 
     for line in sw.result_final:
       logger.debug("Gradle output: %s", line)
 
     latest_symlink_path = os.path.abspath(os.path.join(script_dir, "../../prebuilts/APK/latest"))
+    os.makedirs(os.path.dirname(latest_symlink_path), exist_ok=True)
     if os.path.exists(latest_symlink_path) or os.path.islink(latest_symlink_path):
       logger.debug("Removing old symlink: %s", latest_symlink_path)
       try:
