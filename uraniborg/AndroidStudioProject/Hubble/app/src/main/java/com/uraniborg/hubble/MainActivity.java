@@ -95,6 +95,7 @@ public class MainActivity extends AppCompatActivity {
   // this allows us to get APEX packages when calling getInstalledPackages
   final int MATCH_APEX = 0x40000000;
 
+  @SuppressWarnings("deprecation")
   private void getInstalledPackagesInformation() {
     String tag = TAG + "-PKGS";
 
@@ -127,6 +128,7 @@ public class MainActivity extends AppCompatActivity {
     Log.d(tag, String.format("There are %d packages (including APEX)", mAllPackages.size()));
   }
 
+  @SuppressWarnings("deprecation")
   private void getAllCertificates() {
     final String tag = TAG + "-CERT";
     for (String pkgName : mAllPackages.keySet()) {
