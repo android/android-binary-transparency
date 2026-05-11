@@ -85,6 +85,7 @@ public class PackageMetadata extends BaseInfo {
    * @param packageManager A valid {@link PackageManager} object used to load app description.
    * @return a valid {@link PackageMetadata} object containing parsed information about the APK.
    */
+  @SuppressWarnings("deprecation")
   static public PackageMetadata parse(Context context, @NotNull PackageInfo packageInfo,
                                       @NotNull PackageManager packageManager) {
     PackageMetadata result = new PackageMetadata();
@@ -494,6 +495,7 @@ public class PackageMetadata extends BaseInfo {
    * {@link PackageMetadata#permissionsDeclared} field.
    * @return <code>true</code> if no errors were encountered. <code>false</code> otherwise.
    */
+  @SuppressWarnings("deprecation")
   public boolean parseDeclaredPermissions() {
     final String TAG = "getDeclaredPerms";
     PermissionInfo[] perms = ref.permissions;
