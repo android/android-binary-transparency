@@ -1,8 +1,9 @@
 # Verifier of Binary Transparency for Pixel Factory Images
 
-This repository contains code to read the transparency log for two logs:
+This repository contains code to read the transparency log for three logs:
   * [Pixel Factory Images Binary Transparency](https://developers.google.com/android/binary_transparency/pixel_overview).
   * [Google System APK Transparency](https://developers.google.com/android/binary_transparency/google1p/overview)
+  * [Google Product Application Transparency](https://developers.google.com/android/binary_transparency/google_apk/overview)
 
 See the particular section for this tool:
   * [Pixel](https://developers.google.com/android/binary_transparency/pixel_verification#verifying-image-inclusion-inclusion-proof)
