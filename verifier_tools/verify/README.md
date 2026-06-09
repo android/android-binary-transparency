@@ -7,6 +7,7 @@ This repository contains code to read the transparency log for two logs:
 See the particular section for this tool:
   * [Pixel](https://developers.google.com/android/binary_transparency/pixel_verification#verifying-image-inclusion-inclusion-proof)
   * [Google System APKs](https://developers.google.com/android/binary_transparency/google1p/verification_details#verifying_package_inclusion_inclusion_proof)
+  * [Google Product Application](https://developers.google.com/android/binary_transparency/google_apk/verification_details)
 
 ## Files and Directories
 * `cmd/verifier/`
@@ -32,16 +33,22 @@ The verifier uses the associated checkpoint (depending on the target log) and th
   * Pixel Transparency Log
     * `https://developers.google.com/android/binary_transparency/tile/`
   * Google System APK Transparency Log
-    * `https://developers.google.com/android/binary_transparency/google1p/tile/`
+    * `https://developers.google.com/android/binary_transparency/google1p/tile/` (old log)
+    * `https://gstatic.com/android/binary_transparency/google1p/jwt/2026/01/tile/` (latest sharded log)
+  * Google Product Application Transparency Log
+    * `https://gstatic.com/android/binary_transparency/google1p/apk/2026/01/tile/`
 
 To run the verifier after you have built it in the previous section:
 ```
 $ ./verifier --payload_path=${PAYLOAD_PATH} --log_type=<log_type>
 ```
-where `log_type` is either `pixel` or `google_system_apk`.
+where `log_type` is one of the following:
+  * `pixel` (for Pixel Factory Images)
+  * `google_1p_code` (for Google System APKs)
+  * `google_1p_apk` (for Google Product Applications)
 
 ### Input
-The verifier takes a `payload_path` and a `log_type `as input.
+The verifier takes a `payload_path` and a `log_type` as input.
 
 #### Pixel
 Each Pixel Factory image corresponds to a [payload](https://developers.google.com/android/binary_transparency/pixel_overview#log_content) stored in the transparency log, the format of which is:
@@ -59,7 +66,19 @@ Each Google System APK corresponds to a [payload](https://developers.google.com/
 Currently, `hash_description` is fixed as `SHA256(Signed Code Transparency JWT)`.
 See [here](https://developers.google.com/android/binary_transparency/google1p/verification_details#construct_a_payload_for_verification) to find out how to construct this payload from a candidate APK.
 
+#### Google Product Application
+Each Google Product Application corresponds to a [payload](https://developers.google.com/android/binary_transparency/google_apk/overview#log_content) stored in the transparency log, the format of which is:
+```
+<hash>\n<hash_description>\n<package_name>\n<package_version_code>\n
+```
+
+The `hash_description` for Google Product Applications is currently fixed as `SHA256(APK)`.
+See [here](https://developers.google.com/android/binary_transparency/google_apk/verification_details#construct_a_payload_for_verification) to find out how to construct this payload from a candidate APK.
+
+
+
+
 ### Output
 The output of the command is written to stdout:
-  * `OK. inclusion check success!` if the candidate binary is included in the log. Depending on which log, this means either the [Pixel claim](https://developers.google.com/android/binary_transparency/pixel_overview#claimant_model) or the [Google System APK claim](https://developers.google.com/android/binary_transparency/google1p/overview#claimant_model) is true,
+  * `OK. inclusion check success!` if the candidate binary is included in the log.
   * `FAILURE` otherwise.
