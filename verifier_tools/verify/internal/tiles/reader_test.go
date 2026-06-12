@@ -93,7 +93,7 @@ func TestReadHashesWithReadTileData(t *testing.T) {
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			r := HashReader{URL: s.URL}
+			r := HashReader{URL: s.URL, TileHeight: tileHeight, TreeSize: int64(tc.size)}
 
 			// Read hashes.
 			for i, want := range tc.want {
@@ -116,7 +116,7 @@ func TestReadHashesCachedTile(t *testing.T) {
 	defer s.Close()
 
 	wantHash := nodeHashes[0][0]
-	r := HashReader{URL: s.URL}
+	r := HashReader{URL: s.URL, TileHeight: tileHeight, TreeSize: 3}
 
 	// Read hash at index 0 twice, to exercise the caching of tiles.
 	// On the first pass, the read is fresh and readFromURL is called.
