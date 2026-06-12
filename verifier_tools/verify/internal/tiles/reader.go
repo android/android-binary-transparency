@@ -8,9 +8,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/mod/sumdb/tlog"
 )
@@ -96,14 +99,121 @@ func (h HashReader) ReadHashes(indices []int64) ([]tlog.Hash, error) {
 
 // BinaryInfosIndex returns a map from payload to its index in the
 // transparency log according to the `binaryInfoFilename` value.
-func BinaryInfosIndex(logBaseURL string, binaryInfoFilename string) (map[string]int64, error) {
-	b, err := readFromURL(logBaseURL, binaryInfoFilename)
+func BinaryInfosIndex(logBaseURL string, binaryInfoFilename string, treeSize int64) (map[string]int64, error) {
+	b, err := readCachedInfoFile(logBaseURL, binaryInfoFilename, treeSize)
 	if err != nil {
 		return nil, err
 	}
 
 	binaryInfos := string(b)
 	return parseBinaryInfosIndex(binaryInfos, binaryInfoFilename)
+}
+
+func readCachedInfoFile(logBaseURL string, binaryInfoFilename string, treeSize int64) ([]byte, error) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		slog.Warn("Failed to get user cache dir, falling back to direct download", "error", err)
+		return readFromURL(logBaseURL, binaryInfoFilename)
+	}
+
+	abtCacheDir := filepath.Join(cacheDir, "android-binary-transparency")
+	if err := os.MkdirAll(abtCacheDir, 0755); err != nil {
+		slog.Warn("Failed to create cache dir, falling back to direct download", "error", err)
+		return readFromURL(logBaseURL, binaryInfoFilename)
+	}
+
+	urlHash := sha256.Sum256([]byte(logBaseURL))
+	basePrefix := fmt.Sprintf("%x_%s", urlHash[:8], binaryInfoFilename)
+	cacheFilename := fmt.Sprintf("%s_%d", basePrefix, treeSize)
+	cachePath := filepath.Join(abtCacheDir, cacheFilename)
+
+	// Try reading from cache
+	if b, err := os.ReadFile(cachePath); err == nil {
+		slog.Debug("Loaded info file from local cache", "path", cachePath)
+		return b, nil
+	}
+
+	// Cache miss, download from URL
+	slog.Info("Downloading new info file", "url", logBaseURL+"/"+binaryInfoFilename)
+	b, err := readFromURL(logBaseURL, binaryInfoFilename)
+	if err != nil {
+		return nil, err
+	}
+
+	// Save to cache atomically
+	tmpFile, err := os.CreateTemp(abtCacheDir, cacheFilename+".*.tmp")
+	if err != nil {
+		slog.Warn("Failed to create cache tmp file", "error", err)
+		return b, nil
+	}
+	tmpPath := tmpFile.Name()
+
+	// Clean up tmp file on exit if it hasn't been renamed
+	defer os.Remove(tmpPath)
+
+	slog.Info("Writing info file to cache", "path", tmpPath)
+	if _, err := tmpFile.Write(b); err != nil {
+		slog.Warn("Failed to write to cache tmp file", "error", err)
+		tmpFile.Close()
+		return b, nil
+	}
+	if err := tmpFile.Close(); err != nil {
+		slog.Warn("Failed to close cache tmp file", "error", err)
+		return b, nil
+	}
+
+	slog.Info("Renaming cache file", "from", tmpPath, "to", cachePath)
+	if err := os.Rename(tmpPath, cachePath); err != nil {
+		slog.Warn("Failed to move cache file to final destination", "error", err)
+		return b, nil
+	}
+
+	slog.Debug("Saved info file to local cache", "path", cachePath)
+
+	// Cleanup old cache files for this specific log URL and filename safely
+	slog.Info("Cleaning up old cache files", "prefix", basePrefix)
+	if entries, err := os.ReadDir(abtCacheDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+
+			// Only process files that match our specific basePrefix
+			if !strings.HasPrefix(entry.Name(), basePrefix+"_") {
+				continue
+			}
+
+			f := filepath.Join(abtCacheDir, entry.Name())
+			if f == cachePath {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			// Delete old temp files (older than 1 hour) left over from hard crashes.
+			// Otherwise, keep current temp files to avoid breaking active concurrent downloads.
+			if strings.HasSuffix(entry.Name(), ".tmp") {
+				if time.Since(info.ModTime()) > time.Hour {
+					if err := os.Remove(f); err == nil {
+						slog.Debug("Cleaned up orphaned cache temp file", "path", f)
+					}
+				}
+				continue
+			}
+
+			// Delete old cache files (older than 24 hours to prevent cache invalidation storms)
+			if time.Since(info.ModTime()) > 24*time.Hour {
+				if err := os.Remove(f); err == nil {
+					slog.Debug("Cleaned up old cache file", "path", f)
+				}
+			}
+		}
+	}
+
+	return b, nil
 }
 
 func parseBinaryInfosIndex(binaryInfos string, binaryInfoFilename string) (map[string]int64, error) {

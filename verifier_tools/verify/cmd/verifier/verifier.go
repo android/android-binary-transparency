@@ -42,7 +42,7 @@ const (
 	KeyNameForVerifierG1PAPK = "gstatic.com/android/binary_transparency/google1p/apk/2026/0"
 	LogBaseURLPixel          = "https://developers.google.com/android/binary_transparency"
 	LogBaseURLG1PJWT         = "https://developers.google.com/android/binary_transparency/google1p"
-	LogBaseURLG1PAPK         = "https://www.gstatic.com/android/binary_transparency/google1p/apk/2026/01/"
+	LogBaseURLG1PAPK         = "https://www.gstatic.com/android/binary_transparency/google1p/apk/2026/01"
 	ImageInfoFilename        = "image_info.txt"
 	PackageInfoFilename      = "package_info.txt"
 )
@@ -127,7 +127,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	m, err := tiles.BinaryInfosIndex(logBaseURL, binaryInfoFilename)
+	logSize := int64(root.Size)
+
+	m, err := tiles.BinaryInfosIndex(logBaseURL, binaryInfoFilename, logSize)
 	if err != nil {
 		slog.Error("failed to load binary info map to find log index", "error", err)
 		os.Exit(1)
@@ -141,7 +143,6 @@ func main() {
 	var th tlog.Hash
 	copy(th[:], root.Hash)
 
-	logSize := int64(root.Size)
 	r := tiles.HashReader{URL: logBaseURL, TileHeight: tileHeight, TreeSize: logSize}
 	slog.Debug("tlog.ProveRecord", "logSize", logSize, "binaryInfoIndex", binaryInfoIndex)
 	rp, err := tlog.ProveRecord(logSize, binaryInfoIndex, r)
