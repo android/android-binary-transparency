@@ -67,10 +67,6 @@ def parse_arguments() -> argparse.Namespace:
                       "\"results\" directory can be found.")
   parser.add_argument("-D", "--debug", required=False, action="count",
                       help="If specified, debugging mode is turned on.")
-  parser.add_argument("--use-old-results-classification", required=False,
-                      action="count",
-                      help="If specified, results will be classified using "
-                           "old classification using ADB convention.")
   parser.add_argument("--pull-all-apks", required=False,
                       action="count",
                       help="If specified, the script will attempt to download "
@@ -334,47 +330,6 @@ def wait_for_results(adb_wrapper, logger):
   return adb_wrapper.logcat_find(patterns, terminate_logcat)
 
 
-def classify_dir_using_adb_format(adb_wrapper: syscall_wrapper.AdbWrapper,
-                                  source: str,
-                                  results_dir: str,
-                                  device: syscall_wrapper.DeviceInfo,
-                                  logger: logging.Logger)-> Optional[str]:
-  """Decides which directory in results/ to dump new result to.
-
-  This method is grandfathered as it was the original way of classification,
-  using ADB's information, on product name, model name, and device name.
-
-  Args:
-    adb_wrapper: An AdbWrapper instance.
-    source: the source directory (on target device) containing new results.
-    results_dir: the umbrella results/ directory.
-    device: A DeviceInfo instance containing the device to operate on.
-    logger: A logger object to log debug or error messages.
-
-  Returns:
-    A string representing the final directory (on host) where results are pulled
-    to. <code>None</code> is returned if any failure is encountered along the
-    way.
-  """
-  target_dir_parent = os.path.join(results_dir, "{}-{}-{}".format(
-      device.product_name, device.model_name, device.device_name))
-  if not os.path.exists(target_dir_parent):
-    logger.debug("{} does not exist yet. Creating...".format(target_dir_parent))
-    os.makedirs(target_dir_parent)
-
-  target_dir = ""
-  for i in range(1000):
-    target_dir = os.path.join(target_dir_parent, "{0:03d}".format(i))
-    logger.debug("Testing {} as target directory.".format(target_dir))
-    if not os.path.exists(target_dir):
-      logger.debug("{} does not exist yet! Using it!".format(target_dir))
-      break
-
-  if adb_wrapper.pull(source, target_dir):
-    return target_dir
-  return None
-
-
 def _retry_apk_extraction(adb_wrapper: syscall_wrapper.AdbWrapper,
                           retry_packages_dict: dict[str, str],
                           apks_dir: str,
@@ -635,9 +590,7 @@ def classify_dir_using_build_fingerprint(
 def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
                              source: str,
                              destination: str,
-                             device: syscall_wrapper.DeviceInfo,
                              logger: logging.Logger,
-                             use_old_classification=False,
                              extract_apks=False) -> Optional[str]:
   """Extracts results (and optionally APKs) from Hubble's execution.
 
@@ -645,12 +598,7 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
     adb_wrapper: An AdbWrapper object that is used to issue ADB commands.
     source: the path to where results live (on device).
     destination: the path to where results should be copied to (on host).
-    device: A DeviceInfo object containing the device to operate on.
     logger: A logger object to log debug or error messages.
-    use_old_classification: A boolean indicating whether to revert to old
-                            classification of result, i.e. based on how ADB
-                            displays device information. This is defaulted to
-                            False.
     extract_apks: A boolean indicating whether to also extract APKs from the
                   device or not. This is defaulted to False.
 
@@ -679,14 +627,6 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
   else:
     logger.debug("{} does not exist yet. Creating...".format(results_dir))
     os.makedirs(results_dir, exist_ok=True)
-
-  if use_old_classification:
-    # Note that this method will not support pulling APKs from device.
-    return classify_dir_using_adb_format(adb_wrapper,
-                                         source,
-                                         results_dir,
-                                         device,
-                                         logger)
 
   return classify_dir_using_build_fingerprint(adb_wrapper,
                                               source,
@@ -907,14 +847,11 @@ def main():
     if not results_source:
       logger.error("Failed to obtain results from Hubble execution.")
       continue
-    use_old_classification = args.use_old_results_classification is not None
     extract_apks = args.pull_all_apks is not None
     results_dir = extract_results_and_apks(adb_wrapper,
                                            results_source,
                                            args.output,
-                                           target_device,
                                            logger,
-                                           use_old_classification,
                                            extract_apks)
 
     if not results_dir:
