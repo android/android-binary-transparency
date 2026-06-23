@@ -9,14 +9,6 @@ can be obtained.
 This repository currently contains code that can be used to build an explorer
 app (APK) called Hubble.
 
-It also contains code that can be used to score device preload risks. In this
-effort, we collaborated with a team of university experts from the University of
-Cambridge, University of Strathclyde, and Johannes Kepler University in Linz,
-who created a formula that considers the risk of platform signed apps,
-pregranted permissions on preloaded apps, and apps communicating using cleartext
-traffic. A whitepaper of the scoring framework is also available at:
-https://www.android-device-security.org/publications/
-
 The name of this project and its components are mainly inspired by the field of
 astronomy.
 
@@ -35,10 +27,6 @@ Below are links to more specific documentations.
 
 ### Data Interpretation
 - [Interpreting Hubble results](docs/hubble_results.md)
-
-### Risk Analysis
-- [Scoring device preload risks](docs/device_scoring.md)
-- [Adding new baseline for new OS release](docs/adding_new_baseline.md)
 
 ## Version
 The current version info can be found within the VERSION file, and in the
