@@ -17,15 +17,7 @@ See the particular section for this tool:
   * Internal libraries for the verifier binary.
 
 ## Build
-This module requires Go 1.17. Install [here](https://go.dev/doc/install), and run `go build cmd/verifier/verifier.go`.
-
-If you are building on `macOS 15 (Sequoia)` where all Mach-O executables are mandated to contain the `LC_UUID` load command, you will need to build with extra parameters as below, and then sign the binary.
-This is because when `-linkmode=external` is used, the resulting binary can sometimes end up with an invalid or missing signature. This can be resolved by manually applying an ad-hoc signature to your compiled binary using macOS's built-in `codesign` utility.
-
-```bash
-go build -ldflags="-linkmode=external" -o verifier cmd/verifier/verifier.go
-codesign -s - -f ./verifier
-```
+This module requires Go 1.24. Install [here](https://go.dev/doc/install), and run `go build cmd/verifier/verifier.go`.
 
 An executable named `verifier` should be produced upon successful build.
 
