@@ -1,6 +1,6 @@
 module github.com/android/android-binary-transparency/verifier_tools/verify
 
-go 1.17
+go 1.24
 
 require (
 	github.com/google/go-cmp v0.5.7
