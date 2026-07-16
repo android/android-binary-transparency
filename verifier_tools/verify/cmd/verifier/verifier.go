@@ -36,15 +36,18 @@ import (
 // Domain separation prefix for Merkle tree hashing with second preimage
 // resistance similar to that used in RFC 6962.
 const (
-	LeafHashPrefix           = 0
-	KeyNameForVerifierPixel  = "pixel_transparency_log"
-	KeyNameForVerifierG1PJWT = "developers.google.com/android/binary_transparency/google1p/0"
-	KeyNameForVerifierG1PAPK = "gstatic.com/android/binary_transparency/google1p/apk/2026/0"
-	LogBaseURLPixel          = "https://developers.google.com/android/binary_transparency"
-	LogBaseURLG1PJWT         = "https://developers.google.com/android/binary_transparency/google1p"
-	LogBaseURLG1PAPK         = "https://www.gstatic.com/android/binary_transparency/google1p/apk/2026/01"
-	ImageInfoFilename        = "image_info.txt"
-	PackageInfoFilename      = "package_info.txt"
+	LeafHashPrefix                   = 0
+	KeyNameForVerifierPixel          = "pixel_transparency_log"
+	KeyNameForVerifierG1PJWT         = "developers.google.com/android/binary_transparency/google1p/0"
+	KeyNameForVerifierG1PAPK         = "gstatic.com/android/binary_transparency/google1p/apk/2026/0"
+	KeyNameForVerifierMainlineModule = "gstatic.com/android/binary_transparency/mainline/modules/2026/0"
+	LogBaseURLPixel                  = "https://developers.google.com/android/binary_transparency"
+	LogBaseURLG1PJWT                 = "https://developers.google.com/android/binary_transparency/google1p"
+	LogBaseURLG1PAPK                 = "https://www.gstatic.com/android/binary_transparency/google1p/apk/2026/01"
+	LogBaseURLMainlineModule         = "https://www.gstatic.com/android/binary_transparency/mainline/2026/01"
+	ImageInfoFilename                = "image_info.txt"
+	PackageInfoFilename              = "package_info.txt"
+	ModuleInfoFilename               = "module_info.txt"
 )
 
 // See https://developers.google.com/android/binary_transparency/pixel_tech_details#log_implementation.
@@ -57,12 +60,19 @@ var pixelLogPubKey []byte
 //go:embed log_pub_key.google_system_apk.pem
 var googleSystemAppLogPubKey []byte
 
+// See https://developers.google.com/android/binary_transparency/google_apk/log_details#log_implementation.
+//
 //go:embed log_pub_key.google_apk.pem
 var googleAPKLogPubKey []byte
 
+// See https://developers.google.com/android/binary_transparency/mainline_modules/log_details#log_implementation.
+//
+//go:embed log_pub_key.mainline_module.pem
+var mainlineModuleLogPubKey []byte
+
 var (
 	payloadPath = flag.String("payload_path", "", "Path to the payload describing the binary of interest.")
-	logType     = flag.String("log_type", "", "Which log: 'pixel' or 'google_1p_code' or 'google_1p_apk'.")
+	logType     = flag.String("log_type", "", "Which log: 'pixel' or 'google_1p_code' or 'google_1p_apk' or 'mainline_module'.")
 )
 
 func main() {
@@ -91,7 +101,7 @@ func main() {
 	var tileHeight int
 	switch *logType {
 	case "":
-		slog.Error("must specify which log to verify against: 'pixel' or 'google_1p_code' or 'google_1p_apk'")
+		slog.Error("must specify which log to verify against using '--log_type' flag: {pixel, google_1p_code, google_1p_apk, mainline_module}")
 		os.Exit(1)
 	case "pixel":
 		logPubKey = pixelLogPubKey
@@ -110,6 +120,12 @@ func main() {
 		logBaseURL = LogBaseURLG1PAPK
 		keyNameForVerifier = KeyNameForVerifierG1PAPK
 		binaryInfoFilename = PackageInfoFilename
+		tileHeight = 8
+	case "mainline_module":
+		logPubKey = mainlineModuleLogPubKey
+		logBaseURL = LogBaseURLMainlineModule
+		keyNameForVerifier = KeyNameForVerifierMainlineModule
+		binaryInfoFilename = ModuleInfoFilename
 		tileHeight = 8
 	default:
 		slog.Error("unsupported log type")

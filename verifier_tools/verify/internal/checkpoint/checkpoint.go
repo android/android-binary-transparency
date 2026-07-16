@@ -43,6 +43,8 @@ const (
 	originIDG1P = "developers.google.com/android/binary_transparency/google1p/0\n"
 	// originIDG1PAPK identifies a checkpoint for the Google 1P APK Transparency Log.
 	originIDG1PAPK = "gstatic.com/android/binary_transparency/google1p/apk/2026/0\n"
+	// originIDMainlineModule identifies a checkpoint for the Android Mainline Module Transparency Log.
+	originIDMainlineModule = "gstatic.com/android/binary_transparency/mainline/modules/2026/0\n"
 )
 
 type verifier interface {
@@ -119,6 +121,8 @@ func parseCheckpoint(ckpt string) (Root, error) {
 		body = ckpt[len(originIDG1P):]
 	case strings.HasPrefix(ckpt, originIDG1PAPK):
 		body = ckpt[len(originIDG1PAPK):]
+	case strings.HasPrefix(ckpt, originIDMainlineModule):
+		body = ckpt[len(originIDMainlineModule):]
 	default:
 		return Root{}, fmt.Errorf("invalid checkpoint - unknown origin, must be either %s, %s, or %s", originIDPixel, originIDG1P, originIDG1PAPK)
 	}
