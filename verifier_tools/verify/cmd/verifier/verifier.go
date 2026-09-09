@@ -51,6 +51,7 @@ const (
 	NoteVerifierMainlineModule202602 = "android.transparency.goog/mainline/modules/2026/1+1a8e4064+AfwnHm59rNQTJICchMd7a2W5PQa7nC5h2gTEfq3fhCEI"
 	ImageInfoFilename                = "image_info.txt"
 	PackageInfoFilename              = "package_info.txt"
+	PackageInfo2Filename             = "package_info2.txt"
 	ModuleInfoFilename               = "module_info.txt"
 )
 
@@ -80,13 +81,13 @@ var (
 )
 
 type logTarget struct {
-	name               string
-	baseURL            string
-	checkpointPath     string
-	verifier           note.Verifier
-	tileHeight         int
-	isTessera          bool
-	binaryInfoFilename string
+	name                string
+	baseURL             string
+	checkpointPath      string
+	verifier            note.Verifier
+	tileHeight          int
+	isTessera           bool
+	binaryInfoFilenames []string
 }
 
 func main() {
@@ -120,13 +121,13 @@ func main() {
 			os.Exit(1)
 		}
 		targets = append(targets, logTarget{
-			name:               "pixel",
-			baseURL:            LogBaseURLPixel,
-			checkpointPath:     "checkpoint.txt",
-			verifier:           v,
-			tileHeight:         1,
-			isTessera:          false,
-			binaryInfoFilename: ImageInfoFilename,
+			name:                "pixel",
+			baseURL:             LogBaseURLPixel,
+			checkpointPath:      "checkpoint.txt",
+			verifier:            v,
+			tileHeight:          1,
+			isTessera:           false,
+			binaryInfoFilenames: []string{ImageInfoFilename},
 		})
 	case "google_1p_code":
 		v, err := checkpoint.NewVerifier(googleSystemAppLogPubKey, KeyNameForVerifierG1PJWT)
@@ -135,13 +136,13 @@ func main() {
 			os.Exit(1)
 		}
 		targets = append(targets, logTarget{
-			name:               "google_1p_code",
-			baseURL:            LogBaseURLG1PJWT,
-			checkpointPath:     "checkpoint.txt",
-			verifier:           v,
-			tileHeight:         1,
-			isTessera:          false,
-			binaryInfoFilename: PackageInfoFilename,
+			name:                "google_1p_code",
+			baseURL:             LogBaseURLG1PJWT,
+			checkpointPath:      "checkpoint.txt",
+			verifier:            v,
+			tileHeight:          1,
+			isTessera:           false,
+			binaryInfoFilenames: []string{PackageInfoFilename},
 		})
 	case "google_1p_apk":
 		// Shard 2026/02: Tessera log
@@ -166,13 +167,13 @@ func main() {
 			os.Exit(1)
 		}
 		targets = append(targets, logTarget{
-			name:               "google_1p_apk (2026/01)",
-			baseURL:            LogBaseURLG1PAPK202601,
-			checkpointPath:     "checkpoint.txt",
-			verifier:           v1,
-			tileHeight:         8,
-			isTessera:          false,
-			binaryInfoFilename: PackageInfoFilename,
+			name:                "google_1p_apk (2026/01)",
+			baseURL:             LogBaseURLG1PAPK202601,
+			checkpointPath:      "checkpoint.txt",
+			verifier:            v1,
+			tileHeight:          8,
+			isTessera:           false,
+			binaryInfoFilenames: []string{PackageInfo2Filename, PackageInfoFilename},
 		})
 	case "mainline_module":
 		// Shard 2026/02: Tessera log
@@ -197,13 +198,13 @@ func main() {
 			os.Exit(1)
 		}
 		targets = append(targets, logTarget{
-			name:               "mainline_module (2026/01)",
-			baseURL:            LogBaseURLMainlineModule202601,
-			checkpointPath:     "checkpoint.txt",
-			verifier:           v1,
-			tileHeight:         8,
-			isTessera:          false,
-			binaryInfoFilename: ModuleInfoFilename,
+			name:                "mainline_module (2026/01)",
+			baseURL:             LogBaseURLMainlineModule202601,
+			checkpointPath:      "checkpoint.txt",
+			verifier:            v1,
+			tileHeight:          8,
+			isTessera:           false,
+			binaryInfoFilenames: []string{ModuleInfoFilename},
 		})
 	default:
 		slog.Error("unsupported log type")
@@ -232,14 +233,18 @@ func main() {
 			binaryInfoIndex = idx
 			found = ok
 		} else {
-			m, err := tiles.BinaryInfosIndex(target.baseURL, target.binaryInfoFilename, logSize)
-			if err != nil {
-				slog.Warn("Failed to load binary info map", "log", target.name, "error", err)
-				continue
+			for _, filename := range target.binaryInfoFilenames {
+				m, err := tiles.BinaryInfosIndex(target.baseURL, filename, logSize)
+				if err != nil {
+					slog.Warn("Failed to load binary info map", "log", target.name, "file", filename, "error", err)
+					continue
+				}
+				if idx, ok := m[string(payloadBytes)]; ok {
+					binaryInfoIndex = idx
+					found = true
+					break
+				}
 			}
-			idx, ok := m[string(payloadBytes)]
-			binaryInfoIndex = idx
-			found = ok
 		}
 
 		if !found {

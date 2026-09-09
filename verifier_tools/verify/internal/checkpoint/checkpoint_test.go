@@ -134,6 +134,11 @@ func TestValidCheckpointFormat(t *testing.T) {
 			wantSize: 10,
 		},
 		{
+			desc:     "google 1p apk origin",
+			m:        "gstatic.com/android/binary_transparency/google1p/apk/2026/0\n1797152\nIkmuYB2xKKEOLiaQkIho1o9/uGjrKDbk8xa3xXaFeHY=\n",
+			wantSize: 1797152,
+		},
+		{
 			desc:     "google 1p apk tessera origin",
 			m:        "android.transparency.goog/google1p/apk/2026/1\n42\ndGhlIHZpZXcgZnJvbSB0aGUgdHJlZSB0b3BzIGlzIGdyZWF0IQ==\n",
 			wantSize: 42,

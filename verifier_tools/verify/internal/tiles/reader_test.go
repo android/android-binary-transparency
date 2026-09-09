@@ -198,6 +198,15 @@ func TestParsePackageInfosIndex(t *testing.T) {
 			},
 		},
 		{
+			desc:         "package_info2 format with large indices",
+			packageInfos: "1714861\nhash0\nhash_desc0\npackage_name0\npackage_version0\n\n1797151\nhash1\nhash_desc1\npackage_name1\npackage_version1\n",
+			wantErr:      false,
+			want: map[string]int64{
+				"hash0\nhash_desc0\npackage_name0\npackage_version0\n": 1714861,
+				"hash1\nhash_desc1\npackage_name1\npackage_version1\n": 1797151,
+			},
+		},
+		{
 			desc:         "invalid log entry (no newlines)",
 			packageInfos: "0hashhash_descpackage_namepackage_version",
 			wantErr:      true,
