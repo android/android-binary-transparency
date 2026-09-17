@@ -21,16 +21,78 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
+from typing import Optional
 
 OUTPUT_FILENAME = 'packages_with_inclusion_proof_signal.txt'
+DEFAULT_PREFETCH_CONCURRENCY = 16
+DEFAULT_PREFETCH_TIMEOUT = 600
+
+
+def prefetch_log_entries(verifier_executable: str,
+                         logger: logging.Logger,
+                         cache_dir: Optional[str] = None,
+                         concurrency: int = DEFAULT_PREFETCH_CONCURRENCY,
+                         timeout: int = DEFAULT_PREFETCH_TIMEOUT) -> bool:
+  """Pre-fetches and locally caches transparency log entries up to checkpoint.
+
+  Args:
+    verifier_executable: path to verifier tool.
+    logger: logger instance.
+    cache_dir: optional custom root directory for local cache.
+    concurrency: number of concurrent worker threads for fetching Tessera tiles.
+    timeout: maximum time in seconds to wait for pre-fetching before timing out.
+
+  Returns:
+    True if pre-fetching succeeded, False otherwise.
+  """
+  try:
+    cmd = [
+        verifier_executable,
+        "--log_type=google_1p_apk",
+        "--fetch_entries",
+        f"--concurrency={concurrency}",
+    ]
+    if cache_dir:
+      cmd.append(f"--cache_dir={cache_dir}")
+
+    logger.info("Pre-fetching transparency log entries (concurrency=%d)...",
+                concurrency)
+    logger.debug("Running verifier prefetch: %s", " ".join(cmd))
+    result = subprocess.run(cmd, check=False, timeout=timeout)
+    if result.returncode == 0:
+      logger.info("Successfully pre-fetched and cached log entries.")
+      return True
+    else:
+      logger.warning(
+          "Pre-fetching log entries exited with code %d. "
+          "Falling back to on-demand tile fetching during verification.",
+          result.returncode)
+      return False
+  except subprocess.TimeoutExpired:
+    logger.warning(
+        "Pre-fetching log entries timed out after %d seconds. "
+        "Falling back to on-demand tile fetching during verification.",
+        timeout)
+    return False
+  except FileNotFoundError:
+    logger.error("`%s` command not found.", verifier_executable)
+    return False
+  except Exception as e:
+    logger.warning("Error pre-fetching log entries: %s. Continuing...", e)
+    return False
+
 
 def run_verifier(verifier_executable: str, payload_path: str,
-                 logger: logging.Logger) -> bool:
+                 logger: logging.Logger,
+                 cache_dir: Optional[str] = None) -> bool:
   """Runs verifier tool and returns True if inclusion proof is successful."""
   try:
     cmd = [verifier_executable, f"--payload_path={payload_path}",
            "--log_type=google_1p_apk"]
+    if cache_dir:
+      cmd.append(f"--cache_dir={cache_dir}")
     with open(payload_path, "r") as f_in:
       payload = f_in.read()
       logger.debug("payload content: %s", payload)
@@ -53,21 +115,36 @@ def run_verifier(verifier_executable: str, payload_path: str,
     return False
 
 
-def perform_inclusion_proof_check(verifier_executable: str,
-                                  packages_file_path: str,
-                                  logger: logging.Logger):
+def perform_inclusion_proof_check(
+    verifier_executable: str,
+    packages_file_path: str,
+    logger: logging.Logger,
+    cache_dir: Optional[str] = None,
+    concurrency: int = DEFAULT_PREFETCH_CONCURRENCY,
+    timeout: int = DEFAULT_PREFETCH_TIMEOUT,
+    prefetch: bool = True) -> bool:
   """Reads packages.txt and performs inclusion proof check for each APK split.
 
-  It writes results to file which name defined in OUTPUT_FILENAME in same dir.
+  By default, pre-fetches and locally caches transparency log entries before
+  verifying individual package splits. Writes results to file defined in
+  OUTPUT_FILENAME in the same directory as packages.txt.
 
   Args:
     verifier_executable: path to verifier tool.
     packages_file_path: path to packages.txt.
     logger: logger instance.
+    cache_dir: optional custom root directory for local cache.
+    concurrency: number of concurrent workers for fetching Tessera entry tiles.
+    timeout: maximum time in seconds to wait for pre-fetching before timing out.
+    prefetch: whether to pre-fetch log entries before verifying packages.
+
+  Returns:
+    True if packages.txt was valid and inclusion proof results were successfully
+    written to disk, False otherwise.
   """
   if not os.path.isfile(packages_file_path):
     logger.error("packages.txt not found at %s", packages_file_path)
-    return
+    return False
 
   logger.info("Performing inclusion proof check...")
   try:
@@ -75,11 +152,19 @@ def perform_inclusion_proof_check(verifier_executable: str,
       packages_json = json.load(f_in)
   except json.JSONDecodeError as e:
     logger.error("Failed to parse %s: %s", packages_file_path, e)
-    return
+    return False
 
-  if "packages" not in packages_json:
-    logger.error("No 'packages' key in %s", packages_file_path)
-    return
+  if not isinstance(packages_json.get("packages"), list):
+    logger.error("No valid 'packages' list found in %s", packages_file_path)
+    return False
+
+  if prefetch and packages_json["packages"]:
+    prefetch_log_entries(
+        verifier_executable,
+        logger,
+        cache_dir=cache_dir,
+        concurrency=concurrency,
+        timeout=timeout)
 
   for package in packages_json["packages"]:
     if "name" not in package or "versionCode" not in package:
@@ -121,7 +206,11 @@ def perform_inclusion_proof_check(verifier_executable: str,
           fp.write(payload)
           temp_payload_path = fp.name
 
-        verified = run_verifier(verifier_executable, temp_payload_path, logger)
+        verified = run_verifier(
+            verifier_executable,
+            temp_payload_path,
+            logger,
+            cache_dir=cache_dir)
         split["inclusion_proof_verified"] = verified
       finally:
         if temp_payload_path and os.path.exists(temp_payload_path):
@@ -149,18 +238,41 @@ def perform_inclusion_proof_check(verifier_executable: str,
     with open(output_path, "w") as f_out:
       json.dump(output_json, f_out, indent=2)
     logger.info("Inclusion proof results written to %s", output_path)
+    return True
   except Exception as e:
     logger.error("Failed to write results to %s: %s", output_path, e)
+    return False
 
 
 def main():
   parser = argparse.ArgumentParser(
-      description="Perform inclusion proof check on packages.txt.",
+      description="Perform inclusion proof check on packages.txt. By default, "
+                  "pre-fetches and caches transparency log entries locally "
+                  "before verifying individual package splits. Exits 0 when "
+                  "results are written to disk (even if individual splits fail "
+                  "verification) and exits 1 only on input or execution errors.",
       formatter_class=argparse.ArgumentDefaultsHelpFormatter)
   parser.add_argument("--packages_file", required=True,
                       help="Path to packages.txt file.")
   parser.add_argument("--verifier_path", required=True,
                       help="Path to verifier executable.")
+  parser.add_argument("--cache_dir", required=False, default=None,
+                      help="Custom root directory for local cache used by "
+                           "verifier. If unspecified, defaults to system cache "
+                           "directory.")
+  parser.add_argument("--cache_prefetch_concurrency", required=False, type=int,
+                      default=DEFAULT_PREFETCH_CONCURRENCY,
+                      help="Number of concurrent workers for fetching Tessera "
+                           "entry tiles when pre-fetching log entries.")
+  parser.add_argument("--cache_prefetch_timeout", required=False, type=int,
+                      default=DEFAULT_PREFETCH_TIMEOUT,
+                      help="Timeout in seconds for pre-fetching transparency "
+                           "log entries before falling back to on-demand "
+                           "fetching.")
+  parser.add_argument("--no_prefetch", required=False, action="store_true",
+                      help="If specified, disables pre-fetching and caching of "
+                           "transparency log entries before running inclusion "
+                           "proof checks.")
   parser.add_argument("-D", "--debug", required=False, action="store_true",
                       help="If specified, debugging mode is turned on.")
   args = parser.parse_args()
@@ -176,7 +288,15 @@ def main():
   s_handler.setFormatter(s_format)
   logger.addHandler(s_handler)
 
-  perform_inclusion_proof_check(args.verifier_path, args.packages_file, logger)
+  if not perform_inclusion_proof_check(
+      args.verifier_path,
+      args.packages_file,
+      logger,
+      cache_dir=args.cache_dir,
+      concurrency=args.cache_prefetch_concurrency,
+      timeout=args.cache_prefetch_timeout,
+      prefetch=not args.no_prefetch):
+    sys.exit(1)
 
 
 if __name__ == "__main__":

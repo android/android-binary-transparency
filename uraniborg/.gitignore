@@ -11,12 +11,6 @@ gen/
 # Local config files (sdk path, etc)
 local.properties
 
-# Mac junks
-.DS_Store
-
-# Python related
-*.pyc
-
 # Some files specific to Android Studio
 *.iml
 .idea

@@ -28,6 +28,31 @@ Below are links to more specific documentations.
 ### Data Interpretation
 - [Interpreting Hubble results](docs/hubble_results.md)
 
+## Testing
+
+Unit tests for the Python automation and verification scripts are located in
+`scripts/python/tests/` and use the `pytest` framework:
+
+- `test_inclusion_proof_check.py`: Tests pre-fetching transparency log entries
+  (`--cache_prefetch_concurrency`, `--cache_prefetch_timeout`, `--cache_dir`),
+  opt-out (`--no_prefetch`), fail-open fallback on pre-fetch errors/timeouts,
+  input validation, exit codes (`0` when output is written vs. `1` on
+  execution/input error), and split inclusion verification.
+- `test_automate_observation.py`: Tests multi-device pre-fetch retry and latch
+  behavior across connected devices.
+
+To set up a virtual environment and run the test suite from the repository root:
+
+```bash
+# Set up a virtual environment and install pytest (one-time setup)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pytest
+
+# Run the test suite
+pytest uraniborg/scripts/python/tests/
+```
+
 ## Version
 The current version info can be found within the VERSION file, and in the
 build.gradle file of the Hubble app.
