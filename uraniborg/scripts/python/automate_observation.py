@@ -78,10 +78,31 @@ def parse_arguments() -> argparse.Namespace:
                       help="If specified, after pulling results, perform "
                            "inclusion proof check for each package APK split "
                            "and write results to "
-                           "packages_with_inclusion_proof_signal.txt.")
+                           "packages_with_inclusion_proof_signal.txt. By "
+                           "default, transparency log entries are pre-fetched "
+                           "and cached locally beforehand.")
   parser.add_argument("--verifier_path", required=False,
                       help="Path to verifier executable, used if "
                            "--perform_inclusion_proof_check is specified.")
+  parser.add_argument("--cache_dir", required=False, default=None,
+                      help="Custom root directory for local cache used by "
+                           "verifier during inclusion proof checks. If "
+                           "unspecified, defaults to system cache directory.")
+  parser.add_argument("--cache_prefetch_concurrency", required=False, type=int,
+                      default=inclusion_proof_check.DEFAULT_PREFETCH_CONCURRENCY,
+                      help="Number of concurrent workers for fetching Tessera "
+                           "entry tiles when pre-fetching log entries during "
+                           "inclusion proof checks.")
+  parser.add_argument("--cache_prefetch_timeout", required=False, type=int,
+                      default=inclusion_proof_check.DEFAULT_PREFETCH_TIMEOUT,
+                      help="Timeout in seconds for pre-fetching transparency "
+                           "log entries before falling back to on-demand "
+                           "fetching.")
+  parser.add_argument("--no_prefetch", required=False, action="store_true",
+                      help="If specified, disables pre-fetching and caching of "
+                           "transparency log entries before running inclusion "
+                           "proof checks (pre-fetching is enabled by default "
+                           "when --perform_inclusion_proof_check is specified).")
   args = parser.parse_args()
 
   if args.perform_inclusion_proof_check and args.verifier_path is None:
@@ -807,6 +828,7 @@ def main():
     logger.warning("More than 1 device connected!")
 
   results = {}
+  prefetched = False
   for target_device in connected_devices:
     if target_device.unauthorized:
       logger.error("Please authorize device with serial number %s for ADB via "
@@ -864,8 +886,22 @@ def main():
 
     if args.perform_inclusion_proof_check:
       packages_txt_path = os.path.join(results_dir, "results", "packages.txt")
+      if (not args.no_prefetch and not prefetched and
+          os.path.isfile(packages_txt_path)):
+        prefetched = inclusion_proof_check.prefetch_log_entries(
+            args.verifier_path,
+            logger,
+            cache_dir=args.cache_dir,
+            concurrency=args.cache_prefetch_concurrency,
+            timeout=args.cache_prefetch_timeout)
       inclusion_proof_check.perform_inclusion_proof_check(
-          args.verifier_path, packages_txt_path, logger)
+          args.verifier_path,
+          packages_txt_path,
+          logger,
+          cache_dir=args.cache_dir,
+          concurrency=args.cache_prefetch_concurrency,
+          timeout=args.cache_prefetch_timeout,
+          prefetch=False)
 
   for device in results:
     logger.info("SUCCESS! Hubble was successfully deployed and executed on "

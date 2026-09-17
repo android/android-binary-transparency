@@ -1,0 +1,9 @@
+# Python virtual environments and caches
+__pycache__
+*.pyc
+.pytest_cache
+.venv
+venv
+
+# macOS
+.DS_Store
