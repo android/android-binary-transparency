@@ -1,5 +1,5 @@
 # Hubble Results
-After successful invocation of Hubble app, 7 text files should be produced. For
+After successful invocation of Hubble app, 8 text files should be produced. For
 convenience, the content of the text file are essetentially JSON. Therefore, you
 can also use your favorite JSON parsing or viewing tools to navigate the results.
 
@@ -93,8 +93,12 @@ indicating app developer's declaration of whether this package contains code or
 is purely data/resource APK.
 - hash: The SHA256 digest of the package/APK.
 - installLocation: The location where the APK is installed on the system.
-- isPreinstalled: A boolean flag indicating whether the APK is preinstalled or
-installed post setup.
+- isPreinstalled: A boolean flag indicating whether the APK is preinstalled
+(either as the original factory system image package or as an updated version of
+a system application) or installed post setup.
+- isUpdatedSystemApp: A boolean [flag](https://developer.android.com/reference/android/content/pm/ApplicationInfo.html#FLAG_UPDATED_SYSTEM_APP)
+indicating whether this package was installed as an update to a built-in system
+application.
 - isApex: A boolean flag indicating if this package is an [APEX](https://source.android.com/devices/tech/ota/apex) or not.
 - isEnabled: A boolean [flag](https://developer.android.com/reference/android/content/pm/ApplicationInfo.html#enabled)
 telling whether at the time of observation, this package is "active" or in the
@@ -174,6 +178,16 @@ not.
 - desc: the descriptions of this service.
 - permission: the permission that protects this service.
 
+### Pre-installed Packages (preinstalled_packages.txt)
+This file enumerates packages where `isPreinstalled == true`.
+
+> [!NOTE]
+> Despite what the filename may suggest, `preinstalled_packages.txt` includes
+> **both** factory pre-installed packages and updated system applications
+> (`isUpdatedSystemApp == true`). Refer to
+> [Determining Package Installation Status](#determining-package-installation-status)
+> below for guidance on differentiating between the two states.
+
 ## Interpretation
 If you launched Hubble on a brand new device (out of the box) or one that has
 just gone through factory data reset (FDR), you will be able to observe the
@@ -182,3 +196,50 @@ state of the device that is configured by the OEM.
 If you launched Hubble on your current device without going through FDR, you
 are essentially creating a snapshot of your device based on the installed
 packages (including those that are installed post device setup).
+
+### Determining Package Installation Status
+By examining `isPreinstalled`, `isUpdatedSystemApp`, and `isApex`, installed
+packages can be classified into distinct states; APEX entries require additional
+inspection of `installLocation` as described below:
+
+| State | `isPreinstalled` | `isUpdatedSystemApp` | `isApex` | Active Package Location (`installLocation`) | Observed Artifacts & Hash |
+| :--- | :---: | :---: | :---: | :--- | :--- |
+| **Factory Pre-installed (APK)** | `true` | `false` | `false` | System partitions (`/system/...`, `/vendor/...`, `/product/...`) | Original OEM / ROM image binary |
+| **Factory Pre-installed (APEX)** | `true` | `false` | `true` | System partitions, or `/data/apex/active/*@*.decompressed.apex` (decompressed CAPEX) | Original OEM / ROM APEX binary |
+| **Updated System Application (APK)** | `true` | `true` | `false` | Data partition (`/data/app/...`) | Updated APK (shadows original OEM binary) |
+| **Updated Mainline Module (APEX)** | `true` | `false`* | `true` | Data partition (`/data/apex/active/*@*.apex` ending in `.apex`) | Updated APEX (shadows original OEM binary) |
+| **User-Installed Application** | `false` | `false` | `false` | Data partition (`/data/app/...`) | Third-party app installed post-setup |
+
+> [!IMPORTANT]
+> **Measurement Caveat for Updated System Applications (APKs):**
+> When `isUpdatedSystemApp == true`, `installLocation`, `hash`, and
+> `fileSizeInBytes` describe the updated APK in `/data/app`, **not** the factory
+> binary. The original OEM binary is not observable through the Android package
+> manager in this state, so these entries will not match factory image hashes.
+> Perform an FDR before running Hubble if you need factory binary measurements.
+
+> [!WARNING]
+> **Caveat for APEX / Mainline Modules (`isApex == true`):**
+> `FLAG_UPDATED_SYSTEM_APP` is a PackageManager concept specific to APKs.
+> APEX packages updated via Google Play / Mainline land in `/data/apex/active/...`
+> and do **not** set this flag, so `isUpdatedSystemApp` remains `false` (marked `false`*
+> in the table above). Therefore, **`isApex == true` entries are not covered by
+> `isUpdatedSystemApp`**.
+>
+> Furthermore, disambiguation **must key on the filename suffix, not just the directory**.
+> Per AOSP's `apexd` flow, factory compressed APEX modules (`.capex`, standard on Pixel
+> since Android 12) pre-installed under `/system/apex/` are decompressed at boot into
+> `/data/apex/decompressed/<name>@<ver>.decompressed.apex` and hard-linked into
+> `/data/apex/active/` specifically so the rest of the boot path can treat them uniformly.
+> As a consequence, a pristine, never-updated factory Mainline module can present an
+> `installLocation` under `/data/apex/active/...` or `/data/apex/decompressed/...`.
+> Keying on directory alone would falsely classify pristine factory modules as updated.
+> The `.decompressed.apex` suffix is preserved through the hard link.
+>
+> Inspect `installLocation` using the following disambiguation rules:
+>
+> | `installLocation` | Meaning |
+> | :--- | :--- |
+> | `/system/apex/...`, `/vendor/apex/...`, `/system_ext/apex/...`, `/product/apex/...` | **Factory Pre-installed** (uncompressed APEX) |
+> | `/data/apex/active/*@*.decompressed.apex`, `/data/apex/decompressed/*@*.decompressed.apex` | **Factory Pre-installed** (compressed CAPEX decompressed at boot, not an update) |
+> | `/data/apex/active/*@*.apex` (ending in `.apex`, **not** `.decompressed.apex`) | **Updated Mainline Module** (post-setup OTA update via Play / Mainline; hash reflects updated binary) |
