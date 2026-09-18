@@ -15,7 +15,7 @@ In order to automate the data extraction process, which is covered by
 `automate_observation.py` python script. Make sure that your test/target device
 is connected via ADB, and issue the following command from your terminal:
 
-`python3 automate_observations.py`
+`python3 automate_observation.py`
 
 Upon successful execution, you should see messages like:
 ```
@@ -39,8 +39,10 @@ python3 automate_observation.py \
   --verifier_path=/path/to/verifier
 ```
 
-The results are written to `packages_with_inclusion_proof_signal.txt` inside the
-device's results directory. Note that `inclusion_proof_check.py` (when invoked
+The results are written to `packages_with_inclusion_proof_signal.txt` (or
+`preinstalled_packages_with_inclusion_proof_signal.txt` when
+`--check_preinstalled_only` is specified) inside the device's results
+directory. Note that `inclusion_proof_check.py` (when invoked
 standalone or in CI) exits with code `0` whenever the check runs and writes the
 output JSON—even if individual APK splits fail their inclusion proof
 (`"inclusion_proof_verified": false`)—and exits with code `1` only when
@@ -67,6 +69,18 @@ flags:
   the system user cache directory).
 * `--no_prefetch`: Disables pre-fetching log entries up front, falling back to
   on-demand fetching during individual package verifications.
+* `--check_preinstalled_only`: Performs inclusion proof checks against
+  `preinstalled_packages.txt` instead of `packages.txt`, writing results to
+  `preinstalled_packages_with_inclusion_proof_signal.txt`.
+
+### Pulling Pre-installed APKs Only
+By default, `--pull-all-apks` downloads all packages listed in `packages.txt`.
+You can pass `--pull-preinstalled-apks-only` to download only pre-installed
+packages (from `preinstalled_packages.txt`):
+
+```bash
+python3 automate_observation.py --pull-preinstalled-apks-only
+```
 
 ### Running Unit Tests
 Unit tests for the inclusion proof check, pre-fetching, and multi-device

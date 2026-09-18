@@ -9,6 +9,16 @@ changes in the future). It then has a total field describing the number of
 elements of the type of result. This should help detect very basic transmission
 errors that leads to truncation of file, for example.
 
+> [!IMPORTANT]
+> **Version Compatibility (Schema `2.x`, `>= 2.1.0` Required):** Uraniborg's
+> parser (`hubble_parser.py`) and automation tools require Hubble result files
+> matching **schema `2.x` (`>= 2.1.0`)** (which include
+> `preinstalled_packages.txt`, `isUpdatedSystemApp`, and `isApex`). Major
+> version bumps break compatibility; output from Hubble `1.0.0` (or any version
+> `< 2.1.0`) and higher major versions (`>= 3.0.0`) is **not supported**.
+
+<!-- TODO: Remove legacy categorization / baseline helpers in scripts/python/hubble_parser.py and legacy scoring metrics PDF in docs/. -->
+
 ## Components
 ### Binaries (binaries.txt)
 This file enumerates the executable binaries accessible to an untrusted app on
@@ -209,6 +219,7 @@ inspection of `installLocation` as described below:
 | **Updated System Application (APK)** | `true` | `true` | `false` | Data partition (`/data/app/...`) | Updated APK (shadows original OEM binary) |
 | **Updated Mainline Module (APEX)** | `true` | `false`* | `true` | Data partition (`/data/apex/active/*@*.apex` ending in `.apex`) | Updated APEX (shadows original OEM binary) |
 | **User-Installed Application** | `false` | `false` | `false` | Data partition (`/data/app/...`) | Third-party app installed post-setup |
+| **Unknown (`UNKNOWN`)** | any (`false` or `true`) | any | `true` | Unrecognized APEX path (or `isPreinstalled == false`) | Unrecognized OEM / partition layout; surfaces for manual inspection |
 
 > [!IMPORTANT]
 > **Measurement Caveat for Updated System Applications (APKs):**
@@ -243,3 +254,4 @@ inspection of `installLocation` as described below:
 > | `/system/apex/...`, `/vendor/apex/...`, `/system_ext/apex/...`, `/product/apex/...` | **Factory Pre-installed** (uncompressed APEX) |
 > | `/data/apex/active/*@*.decompressed.apex`, `/data/apex/decompressed/*@*.decompressed.apex` | **Factory Pre-installed** (compressed CAPEX decompressed at boot, not an update) |
 > | `/data/apex/active/*@*.apex` (ending in `.apex`, **not** `.decompressed.apex`) | **Updated Mainline Module** (post-setup OTA update via Play / Mainline; hash reflects updated binary) |
+> | Any other path (or `isPreinstalled == false`) | **Unknown (`UNKNOWN`)** (unrecognized OEM APEX layout; emits a warning instead of assuming updated) |

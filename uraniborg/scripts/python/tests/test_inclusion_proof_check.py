@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 
-"""Unit tests for inclusion_proof_check.py using pytest."""
+"""Unit tests for inclusion_proof_check.py."""
 
 import json
 import logging
@@ -23,7 +23,6 @@ from pathlib import Path
 import subprocess
 import sys
 from unittest import mock
-
 import pytest
 
 # Ensure uraniborg/scripts/python is on sys.path
@@ -40,8 +39,9 @@ def logger() -> logging.Logger:
 
 
 @mock.patch("subprocess.run")
-def test_prefetch_log_entries_default(mock_run: mock.MagicMock,
-                                      logger: logging.Logger):
+def test_prefetch_log_entries_default(
+    mock_run: mock.MagicMock, logger: logging.Logger
+):
   mock_run.return_value = mock.Mock(returncode=0)
 
   result = inclusion_proof_check.prefetch_log_entries("/path/to/verifier", logger)
@@ -61,14 +61,16 @@ def test_prefetch_log_entries_default(mock_run: mock.MagicMock,
 
 @mock.patch("subprocess.run")
 def test_prefetch_log_entries_custom_cache_and_concurrency(
-    mock_run: mock.MagicMock, logger: logging.Logger):
+    mock_run: mock.MagicMock, logger: logging.Logger
+):
   mock_run.return_value = mock.Mock(returncode=0)
 
   result = inclusion_proof_check.prefetch_log_entries(
       "/path/to/verifier",
       logger,
       cache_dir="/custom/cache",
-      concurrency=8)
+      concurrency=8,
+  )
 
   assert result is True
   mock_run.assert_called_once_with(
@@ -86,7 +88,8 @@ def test_prefetch_log_entries_custom_cache_and_concurrency(
 
 @mock.patch("subprocess.run")
 def test_prefetch_log_entries_failure_nonzero_returncode(
-    mock_run: mock.MagicMock, logger: logging.Logger):
+    mock_run: mock.MagicMock, logger: logging.Logger
+):
   mock_run.return_value = mock.Mock(returncode=1)
 
   with mock.patch.object(logger, "warning") as mock_warn:
@@ -98,9 +101,11 @@ def test_prefetch_log_entries_failure_nonzero_returncode(
 
 @mock.patch(
     "subprocess.run",
-    side_effect=subprocess.TimeoutExpired(cmd="verifier", timeout=600))
+    side_effect=subprocess.TimeoutExpired(cmd="verifier", timeout=600),
+)
 def test_prefetch_log_entries_timeout(
-    mock_run: mock.MagicMock, logger: logging.Logger):
+    mock_run: mock.MagicMock, logger: logging.Logger
+):
   with mock.patch.object(logger, "warning") as mock_warn:
     result = inclusion_proof_check.prefetch_log_entries("/path/to/verifier", logger)
 
@@ -110,7 +115,8 @@ def test_prefetch_log_entries_timeout(
 
 @mock.patch("subprocess.run", side_effect=FileNotFoundError("verifier not found"))
 def test_prefetch_log_entries_file_not_found(
-    mock_run: mock.MagicMock, logger: logging.Logger):
+    mock_run: mock.MagicMock, logger: logging.Logger
+):
   with mock.patch.object(logger, "error") as mock_error:
     result = inclusion_proof_check.prefetch_log_entries("/bad/verifier", logger)
 
@@ -119,14 +125,14 @@ def test_prefetch_log_entries_file_not_found(
 
 
 @mock.patch("subprocess.run")
-def test_run_verifier_with_cache_dir(mock_run: mock.MagicMock,
-                                     logger: logging.Logger,
-                                     tmp_path: Path):
+def test_run_verifier_with_cache_dir(
+    mock_run: mock.MagicMock, tmp_path: Path, logger: logging.Logger
+):
   mock_run.return_value = mock.Mock(
       returncode=0,
       stdout="OK. inclusion check success!",
-      stderr="")
-
+      stderr="",
+  )
   payload_file = tmp_path / "payload.txt"
   payload_file.write_text("hash\nSHA256(APK)\ncom.example\n1\n")
 
@@ -134,7 +140,8 @@ def test_run_verifier_with_cache_dir(mock_run: mock.MagicMock,
       "/path/to/verifier",
       str(payload_file),
       logger,
-      cache_dir="/custom/cache")
+      cache_dir="/custom/cache",
+  )
 
   assert verified is True
   mock_run.assert_called_once_with(
@@ -151,16 +158,17 @@ def test_run_verifier_with_cache_dir(mock_run: mock.MagicMock,
 
 
 @mock.patch("subprocess.run")
-def test_perform_inclusion_proof_check_with_prefetch(mock_run: mock.MagicMock,
-                                                     logger: logging.Logger,
-                                                     tmp_path: Path):
+def test_perform_inclusion_proof_check_with_prefetch(
+    mock_run: mock.MagicMock, tmp_path: Path, logger: logging.Logger
+):
   def side_effect(cmd, **kwargs):
     if "--fetch_entries" in cmd:
       return mock.Mock(returncode=0, stdout="prefetched", stderr="")
     return mock.Mock(
         returncode=0,
         stdout="OK. inclusion check success!",
-        stderr="")
+        stderr="",
+    )
 
   mock_run.side_effect = side_effect
 
@@ -169,7 +177,7 @@ def test_perform_inclusion_proof_check_with_prefetch(mock_run: mock.MagicMock,
       "packages": [{
           "name": "com.google.android.gm",
           "versionCode": 123,
-          "splits": [{"hash": "abc123hash"}]
+          "splits": [{"hash": "abc123hash"}],
       }]
   }))
 
@@ -180,10 +188,10 @@ def test_perform_inclusion_proof_check_with_prefetch(mock_run: mock.MagicMock,
       cache_dir="/tmp/cache",
       concurrency=32,
       timeout=45,
-      prefetch=True)
+      prefetch=True,
+  )
 
   assert success is True
-  # First call should be prefetch, second call should be package verification
   assert mock_run.call_count == 2
 
   prefetch_cmd = mock_run.call_args_list[0][0][0]
@@ -204,18 +212,20 @@ def test_perform_inclusion_proof_check_with_prefetch(mock_run: mock.MagicMock,
 
 @mock.patch("subprocess.run")
 def test_perform_inclusion_proof_check_prefetch_disabled(
-    mock_run: mock.MagicMock, logger: logging.Logger, tmp_path: Path):
+    mock_run: mock.MagicMock, tmp_path: Path, logger: logging.Logger
+):
   mock_run.return_value = mock.Mock(
       returncode=0,
       stdout="OK. inclusion check success!",
-      stderr="")
+      stderr="",
+  )
 
   packages_file = tmp_path / "packages.txt"
   packages_file.write_text(json.dumps({
       "packages": [{
           "name": "com.google.android.gm",
           "versionCode": 123,
-          "splits": [{"hash": "abc123hash"}]
+          "splits": [{"hash": "abc123hash"}],
       }]
   }))
 
@@ -224,10 +234,10 @@ def test_perform_inclusion_proof_check_prefetch_disabled(
       str(packages_file),
       logger,
       cache_dir="/tmp/cache",
-      prefetch=False)
+      prefetch=False,
+  )
 
   assert success is True
-  # Only 1 call for package verification; no --fetch_entries call
   assert mock_run.call_count == 1
   verify_cmd = mock_run.call_args_list[0][0][0]
   assert "--fetch_entries" not in verify_cmd
@@ -241,15 +251,16 @@ def test_perform_inclusion_proof_check_prefetch_disabled(
 
 @mock.patch("subprocess.run")
 def test_perform_inclusion_proof_check_fail_open_on_prefetch_failure(
-    mock_run: mock.MagicMock, logger: logging.Logger, tmp_path: Path):
+    mock_run: mock.MagicMock, tmp_path: Path, logger: logging.Logger
+):
   def side_effect(cmd, **kwargs):
     if "--fetch_entries" in cmd:
-      # Simulate prefetch failure
       return mock.Mock(returncode=1, stdout="", stderr="prefetch network timeout")
     return mock.Mock(
         returncode=0,
         stdout="OK. inclusion check success!",
-        stderr="")
+        stderr="",
+    )
 
   mock_run.side_effect = side_effect
 
@@ -258,7 +269,7 @@ def test_perform_inclusion_proof_check_fail_open_on_prefetch_failure(
       "packages": [{
           "name": "com.google.android.gm",
           "versionCode": 123,
-          "splits": [{"hash": "abc123hash"}]
+          "splits": [{"hash": "abc123hash"}],
       }]
   }))
 
@@ -266,9 +277,9 @@ def test_perform_inclusion_proof_check_fail_open_on_prefetch_failure(
       "/path/to/verifier",
       str(packages_file),
       logger,
-      prefetch=True)
+      prefetch=True,
+  )
 
-  # Even though prefetch failed, check proceeded fail-open and succeeded
   assert success is True
   assert mock_run.call_count == 2
 
@@ -280,7 +291,8 @@ def test_perform_inclusion_proof_check_fail_open_on_prefetch_failure(
 
 @mock.patch("subprocess.run")
 def test_perform_inclusion_proof_check_skips_prefetch_on_invalid_packages_file(
-    mock_run: mock.MagicMock, logger: logging.Logger, tmp_path: Path):
+    mock_run: mock.MagicMock, tmp_path: Path, logger: logging.Logger
+):
   packages_file = tmp_path / "packages.txt"
   packages_file.write_text(json.dumps({"packages": {"not": "a list"}}))
 
@@ -288,7 +300,8 @@ def test_perform_inclusion_proof_check_skips_prefetch_on_invalid_packages_file(
       "/path/to/verifier",
       str(packages_file),
       logger,
-      prefetch=True)
+      prefetch=True,
+  )
 
   assert success is False
   mock_run.assert_not_called()
@@ -296,7 +309,8 @@ def test_perform_inclusion_proof_check_skips_prefetch_on_invalid_packages_file(
 
 @mock.patch("subprocess.run")
 def test_perform_inclusion_proof_check_empty_packages_list_skips_prefetch_and_succeeds(
-    mock_run: mock.MagicMock, logger: logging.Logger, tmp_path: Path):
+    mock_run: mock.MagicMock, tmp_path: Path, logger: logging.Logger
+):
   packages_file = tmp_path / "packages.txt"
   packages_file.write_text(json.dumps({"packages": []}))
 
@@ -304,7 +318,8 @@ def test_perform_inclusion_proof_check_empty_packages_list_skips_prefetch_and_su
       "/path/to/verifier",
       str(packages_file),
       logger,
-      prefetch=True)
+      prefetch=True,
+  )
 
   assert success is True
   mock_run.assert_not_called()
@@ -312,10 +327,96 @@ def test_perform_inclusion_proof_check_empty_packages_list_skips_prefetch_and_su
   output_file = tmp_path / inclusion_proof_check.OUTPUT_FILENAME
   assert output_file.exists()
   result_json = json.loads(output_file.read_text())
-  assert result_json == {"packages": []}
+  assert result_json == {
+      "source": "packages.txt",
+      "totalPackages": 0,
+      "packages": [],
+  }
 
 
-def test_main_exits_nonzero_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+@mock.patch("subprocess.run")
+def test_perform_inclusion_proof_check_with_preinstalled_packages_and_metadata(
+    mock_run: mock.MagicMock, tmp_path: Path, logger: logging.Logger
+):
+  def side_effect(cmd, **kwargs):
+    if "--fetch_entries" in cmd:
+      return mock.Mock(returncode=0, stdout="prefetched", stderr="")
+    return mock.Mock(
+        returncode=0,
+        stdout="OK. inclusion check success!",
+        stderr="",
+    )
+
+  mock_run.side_effect = side_effect
+
+  # Also create an existing full-run output file to verify it is NOT overwritten
+  existing_full_output = tmp_path / inclusion_proof_check.OUTPUT_FILENAME
+  existing_full_output.write_text(json.dumps({
+      "source": "packages.txt",
+      "totalPackages": 401,
+      "packages": [],
+  }))
+
+  preinstalled_file = tmp_path / "preinstalled_packages.txt"
+  preinstalled_file.write_text(json.dumps({
+      "version": "2.1.0",
+      "totalPreinstalledPackages": 2,
+      "preinstalledPackages": [
+          {
+              "name": "com.android.settings",
+              "versionCode": 100,
+              "isPreinstalled": True,
+              "isUpdatedSystemApp": False,
+              "isApex": False,
+              "splits": [{"hash": "hash_settings"}],
+          },
+          {
+              "name": "com.google.android.apps.maps",
+              "versionCode": 200,
+              "isPreinstalled": True,
+              "isUpdatedSystemApp": True,
+              "isApex": False,
+              "splits": [{"hash": "hash_maps"}],
+          },
+      ],
+  }))
+
+  success = inclusion_proof_check.perform_inclusion_proof_check(
+      "/path/to/verifier",
+      str(preinstalled_file),
+      logger,
+      prefetch=True,
+      preinstalled_only=True,
+  )
+
+  assert success is True
+  # Full-run output artifact remains intact
+  assert json.loads(existing_full_output.read_text())["totalPackages"] == 401
+
+  output_file = tmp_path / inclusion_proof_check.PREINSTALLED_OUTPUT_FILENAME
+  assert output_file.exists()
+  result_json = json.loads(output_file.read_text())
+  assert result_json["source"] == "preinstalled_packages.txt"
+  assert result_json["totalPackages"] == 2
+  assert len(result_json["packages"]) == 2
+  pkg0 = result_json["packages"][0]
+  assert pkg0["name"] == "com.android.settings"
+  assert pkg0["isPreinstalled"] is True
+  assert pkg0["isUpdatedSystemApp"] is False
+  assert pkg0["isApex"] is False
+  assert pkg0["splits"][0]["inclusion_proof_verified"] is True
+
+  pkg1 = result_json["packages"][1]
+  assert pkg1["name"] == "com.google.android.apps.maps"
+  assert pkg1["isPreinstalled"] is True
+  assert pkg1["isUpdatedSystemApp"] is True
+  assert pkg1["isApex"] is False
+  assert pkg1["splits"][0]["inclusion_proof_verified"] is True
+
+
+def test_main_exits_nonzero_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
   missing_file = tmp_path / "does_not_exist.txt"
   monkeypatch.setattr(
       sys,

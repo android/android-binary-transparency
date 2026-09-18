@@ -31,7 +31,7 @@ Usually, it is stored at `/storage/emulated/0/Android/data/com.uraniborg.hubble/
 Do an adb pull to collect your results:<br/>
 `adb pull /storage/emulated/0/Android/data/com.uraniborg.hubble/files/results`
 
-You should find 7 files within the `results` folder that you've just pulled
+You should find 8 files within the `results` folder that you've just pulled
 from the target device:<br/>
 1. binaries.txt<br/>
 2. build.txt<br/>
@@ -40,5 +40,6 @@ from the target device:<br/>
 5. hardware.txt<br/>
 6. libraries.txt<br/>
 7. packages.txt<br/>
+8. preinstalled_packages.txt<br/>
 
 Interpretation of the results is explained in the [results doc](hubble_results.md).
