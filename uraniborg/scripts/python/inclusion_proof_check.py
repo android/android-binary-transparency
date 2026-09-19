@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 
-"""Performs inclusion proof check against packages in packages.txt."""
+"""Performs inclusion proof check against packages in packages.txt or preinstalled_packages.txt."""
 
 import argparse
 import json
@@ -26,6 +26,9 @@ import tempfile
 from typing import Optional
 
 OUTPUT_FILENAME = 'packages_with_inclusion_proof_signal.txt'
+PREINSTALLED_OUTPUT_FILENAME = (
+    'preinstalled_packages_with_inclusion_proof_signal.txt'
+)
 DEFAULT_PREFETCH_CONCURRENCY = 16
 DEFAULT_PREFETCH_TIMEOUT = 600
 
@@ -122,28 +125,33 @@ def perform_inclusion_proof_check(
     cache_dir: Optional[str] = None,
     concurrency: int = DEFAULT_PREFETCH_CONCURRENCY,
     timeout: int = DEFAULT_PREFETCH_TIMEOUT,
-    prefetch: bool = True) -> bool:
-  """Reads packages.txt and performs inclusion proof check for each APK split.
+    prefetch: bool = True,
+    preinstalled_only: Optional[bool] = None) -> bool:
+  """Reads packages.txt or preinstalled_packages.txt and performs inclusion proof check.
 
   By default, pre-fetches and locally caches transparency log entries before
   verifying individual package splits. Writes results to file defined in
-  OUTPUT_FILENAME in the same directory as packages.txt.
+  OUTPUT_FILENAME in the same directory as packages_file_path.
 
   Args:
     verifier_executable: path to verifier tool.
-    packages_file_path: path to packages.txt.
+    packages_file_path: path to packages.txt or preinstalled_packages.txt.
     logger: logger instance.
     cache_dir: optional custom root directory for local cache.
     concurrency: number of concurrent workers for fetching Tessera entry tiles.
     timeout: maximum time in seconds to wait for pre-fetching before timing out.
     prefetch: whether to pre-fetch log entries before verifying packages.
+    preinstalled_only: whether the input file is preinstalled_packages.txt
+                       (expects 'preinstalledPackages' key). If None, inferred
+                       from packages_file_path basename.
 
   Returns:
-    True if packages.txt was valid and inclusion proof results were successfully
-    written to disk, False otherwise.
+    True if the input file was valid and inclusion proof results were
+    successfully written to disk, False otherwise.
   """
   if not os.path.isfile(packages_file_path):
-    logger.error("packages.txt not found at %s", packages_file_path)
+    logger.error("%s not found at %s", os.path.basename(packages_file_path),
+                 packages_file_path)
     return False
 
   logger.info("Performing inclusion proof check...")
@@ -154,11 +162,20 @@ def perform_inclusion_proof_check(
     logger.error("Failed to parse %s: %s", packages_file_path, e)
     return False
 
-  if not isinstance(packages_json.get("packages"), list):
-    logger.error("No valid 'packages' list found in %s", packages_file_path)
+  if preinstalled_only is None:
+    preinstalled_only = (
+        os.path.basename(packages_file_path) == "preinstalled_packages.txt"
+    )
+  expected_key = "preinstalledPackages" if preinstalled_only else "packages"
+  packages_list = packages_json.get(expected_key)
+  if not isinstance(packages_list, list):
+    logger.error(
+        "No valid '%s' list found in %s",
+        expected_key,
+        packages_file_path)
     return False
 
-  if prefetch and packages_json["packages"]:
+  if prefetch and packages_list:
     prefetch_log_entries(
         verifier_executable,
         logger,
@@ -166,7 +183,7 @@ def perform_inclusion_proof_check(
         concurrency=concurrency,
         timeout=timeout)
 
-  for package in packages_json["packages"]:
+  for package in packages_list:
     if "name" not in package or "versionCode" not in package:
       logger.warning("Skipping package due to missing fields: %s",
                      package.get("name", "N/A"))
@@ -217,7 +234,7 @@ def perform_inclusion_proof_check(
           os.remove(temp_payload_path)
 
   filtered_packages = []
-  for p in packages_json.get("packages", []):
+  for p in packages_list:
       if "name" in p and "versionCode" in p and "splits" in p:
           pkg_info = {
               "name": p["name"],
@@ -226,14 +243,25 @@ def perform_inclusion_proof_check(
           }
           if "hash" in p:
               pkg_info["hash"] = p["hash"]
+          if "isPreinstalled" in p:
+              pkg_info["isPreinstalled"] = p["isPreinstalled"]
+          if "isUpdatedSystemApp" in p:
+              pkg_info["isUpdatedSystemApp"] = p["isUpdatedSystemApp"]
+          if "isApex" in p:
+              pkg_info["isApex"] = p["isApex"]
           filtered_packages.append(pkg_info)
 
   output_json = {
-      "packages": filtered_packages
+      "source": os.path.basename(packages_file_path),
+      "totalPackages": len(filtered_packages),
+      "packages": filtered_packages,
   }
 
+  output_filename = (
+      PREINSTALLED_OUTPUT_FILENAME if preinstalled_only else OUTPUT_FILENAME
+  )
   output_path = os.path.join(os.path.dirname(packages_file_path),
-                             OUTPUT_FILENAME)
+                             output_filename)
   try:
     with open(output_path, "w") as f_out:
       json.dump(output_json, f_out, indent=2)

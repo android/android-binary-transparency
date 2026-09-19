@@ -16,10 +16,11 @@
 
 """Unit tests for automate_observation.py CLI parsing and multi-device prefetch latch."""
 
+import json
 import os
+from pathlib import Path
 import sys
 from unittest import mock
-
 import pytest
 
 # Ensure uraniborg/scripts/python is on sys.path
@@ -36,7 +37,9 @@ def _make_mock_device(serial: str):
   return dev
 
 
-def test_parse_arguments_defaults_and_validation(monkeypatch: pytest.MonkeyPatch):
+def test_parse_arguments_defaults_and_validation(
+    monkeypatch: pytest.MonkeyPatch,
+):
   """Verifies default flag values and --verifier_path requirement."""
   monkeypatch.setattr(
       sys,
@@ -60,6 +63,8 @@ def test_parse_arguments_defaults_and_validation(monkeypatch: pytest.MonkeyPatch
       == inclusion_proof_check.DEFAULT_PREFETCH_TIMEOUT
   )
   assert args.no_prefetch is False
+  assert args.pull_preinstalled_apks_only is False
+  assert args.check_preinstalled_only is False
 
   # Missing --verifier_path when --perform_inclusion_proof_check is set should error
   monkeypatch.setattr(
@@ -268,7 +273,7 @@ def test_multi_device_no_prefetch_flag_disables_all_prefetches(
     mock_isfile: mock.MagicMock,
     monkeypatch: pytest.MonkeyPatch,
 ):
-  """Verifies that --no_prefetch skips prefetch_log_entries for all devices."""
+  """Verifies --no_prefetch flag disables prefetch across all devices."""
   monkeypatch.setattr(
       sys,
       "argv",
@@ -303,6 +308,249 @@ def test_multi_device_no_prefetch_flag_disables_all_prefetches(
   assert mock_perform_check.call_count == 2
   assert mock_perform_check.call_args_list[0].kwargs["prefetch"] is False
   assert mock_perform_check.call_args_list[1].kwargs["prefetch"] is False
+
+
+def test_parse_arguments_preinstalled_flags(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  """Verifies --pull-preinstalled-apks-only and --check_preinstalled_only."""
+  monkeypatch.setattr(
+      sys,
+      "argv",
+      [
+          "automate_observation.py",
+          "--pull-preinstalled-apks-only",
+          "--perform_inclusion_proof_check",
+          "--check_preinstalled_only",
+          "--verifier_path=/path/to/verifier",
+      ],
+  )
+  args = automate_observation.parse_arguments()
+  assert args.pull_preinstalled_apks_only is True
+  assert args.check_preinstalled_only is True
+
+
+def test_extract_apks_from_preinstalled_packages(tmp_path: Path):
+  """Verifies extract_apks_from_device uses explicit preinstalled_only intent."""
+  preinstall_file = tmp_path / "preinstalled_packages.txt"
+  preinstall_file.write_text(json.dumps({
+      "version": "2.1.0",
+      "totalPreinstalledPackages": 1,
+      "preinstalledPackages": [{
+          "name": "com.android.settings",
+          "installLocation": "/system/priv-app/Settings/Settings.apk",
+      }],
+  }))
+
+  mock_adb = mock.Mock()
+  mock_adb.pull.return_value = True
+  logger = mock.Mock()
+
+  apks_out = str(tmp_path / "apks")
+  failed = automate_observation.extract_apks_from_device(
+      mock_adb,
+      str(preinstall_file),
+      apks_out,
+      logger,
+      preinstalled_only=True,
+  )
+  assert failed == {}
+  mock_adb.pull.assert_called_once()
+
+  # Verify an empty "packages": [] does NOT fall through to "preinstalledPackages"
+  empty_packages_file = tmp_path / "packages.txt"
+  empty_packages_file.write_text(json.dumps({
+      "version": "2.1.0",
+      "packages": [],
+      "preinstalledPackages": [{
+          "name": "com.android.settings",
+          "installLocation": "/system/priv-app/Settings/Settings.apk",
+      }],
+  }))
+  mock_adb.pull.reset_mock()
+  failed_empty = automate_observation.extract_apks_from_device(
+      mock_adb,
+      str(empty_packages_file),
+      apks_out,
+      logger,
+      preinstalled_only=False,
+  )
+  assert failed_empty == {}
+  mock_adb.pull.assert_not_called()
+
+
+@mock.patch("os.path.isfile", return_value=True)
+@mock.patch("os.path.exists", return_value=True)
+@mock.patch("automate_observation.extract_selinux_policies")
+@mock.patch("automate_observation.extract_results_and_apks")
+@mock.patch("automate_observation.wait_for_results")
+@mock.patch("automate_observation.launch_hubble")
+@mock.patch("automate_observation.clear_logcat")
+@mock.patch("automate_observation.install_hubble")
+@mock.patch("automate_observation.is_xiaomi_phone")
+@mock.patch("automate_observation.is_hubble_installed")
+@mock.patch("automate_observation.AdbWrapper")
+@mock.patch("automate_observation.adb_installed", return_value=True)
+@mock.patch("automate_observation.verify_hubble", return_value=True)
+@mock.patch("automate_observation.supported_platform", return_value=True)
+@mock.patch("inclusion_proof_check.perform_inclusion_proof_check", return_value=True)
+@mock.patch("inclusion_proof_check.prefetch_log_entries", return_value=True)
+def test_main_pull_preinstalled_apks_only_and_check_preinstalled_only(
+    mock_prefetch: mock.MagicMock,
+    mock_perform_check: mock.MagicMock,
+    mock_supported: mock.MagicMock,
+    mock_verify_hubble: mock.MagicMock,
+    mock_adb_installed: mock.MagicMock,
+    mock_adb_wrapper_cls: mock.MagicMock,
+    mock_is_installed: mock.MagicMock,
+    mock_is_xiaomi: mock.MagicMock,
+    mock_install: mock.MagicMock,
+    mock_clear_logcat: mock.MagicMock,
+    mock_launch: mock.MagicMock,
+    mock_wait_results: mock.MagicMock,
+    mock_extract_results: mock.MagicMock,
+    mock_extract_selinux: mock.MagicMock,
+    mock_exists: mock.MagicMock,
+    mock_isfile: mock.MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+  """Verifies --pull-preinstalled-apks-only and --check_preinstalled_only execution paths."""
+  monkeypatch.setattr(
+      sys,
+      "argv",
+      [
+          "automate_observation.py",
+          "-H",
+          "/path/to/hubble.apk",
+          "-o",
+          "/tmp/out",
+          "--pull-preinstalled-apks-only",
+          "--perform_inclusion_proof_check",
+          "--check_preinstalled_only",
+          "--verifier_path=/path/to/verifier",
+      ],
+  )
+  mock_adb_wrapper_cls.start_server.return_value = True
+  mock_adb_wrapper_cls.devices.return_value = [_make_mock_device("DEV1")]
+  mock_is_installed.return_value = False
+  mock_is_xiaomi.return_value = False
+  mock_install.return_value = True
+  mock_launch.return_value = True
+  mock_wait_results.return_value = "/sdcard/hubble/results"
+  mock_extract_results.return_value = "/tmp/out/DEV1"
+
+  automate_observation.main()
+
+  mock_extract_results.assert_called_once()
+  assert mock_extract_results.call_args[0][4] is True  # extract_apks
+  assert mock_extract_results.call_args.kwargs["pull_preinstalled_only"] is True
+
+  mock_perform_check.assert_called_once()
+  checked_file = mock_perform_check.call_args[0][1]
+  assert checked_file.endswith("preinstalled_packages.txt")
+
+
+@mock.patch("os.path.isfile", return_value=False)
+@mock.patch("automate_observation.extract_selinux_policies")
+@mock.patch("automate_observation.extract_results_and_apks")
+@mock.patch("automate_observation.wait_for_results")
+@mock.patch("automate_observation.launch_hubble")
+@mock.patch("automate_observation.clear_logcat")
+@mock.patch("automate_observation.install_hubble")
+@mock.patch("automate_observation.is_xiaomi_phone")
+@mock.patch("automate_observation.is_hubble_installed")
+@mock.patch("automate_observation.AdbWrapper")
+@mock.patch("automate_observation.adb_installed", return_value=True)
+@mock.patch("automate_observation.verify_hubble", return_value=True)
+@mock.patch("automate_observation.supported_platform", return_value=True)
+@mock.patch("inclusion_proof_check.perform_inclusion_proof_check")
+@mock.patch("inclusion_proof_check.prefetch_log_entries")
+def test_main_check_preinstalled_only_fails_loudly_when_file_missing(
+    mock_prefetch: mock.MagicMock,
+    mock_perform_check: mock.MagicMock,
+    mock_supported: mock.MagicMock,
+    mock_verify_hubble: mock.MagicMock,
+    mock_adb_installed: mock.MagicMock,
+    mock_adb_wrapper_cls: mock.MagicMock,
+    mock_is_installed: mock.MagicMock,
+    mock_is_xiaomi: mock.MagicMock,
+    mock_install: mock.MagicMock,
+    mock_clear_logcat: mock.MagicMock,
+    mock_launch: mock.MagicMock,
+    mock_wait_results: mock.MagicMock,
+    mock_extract_results: mock.MagicMock,
+    mock_extract_selinux: mock.MagicMock,
+    mock_isfile: mock.MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+  """Verifies --check_preinstalled_only fails loudly instead of falling back to packages.txt."""
+  monkeypatch.setattr(
+      sys,
+      "argv",
+      [
+          "automate_observation.py",
+          "-H",
+          "/path/to/hubble.apk",
+          "-o",
+          "/tmp/out",
+          "--perform_inclusion_proof_check",
+          "--check_preinstalled_only",
+          "--verifier_path=/path/to/verifier",
+      ],
+  )
+  mock_adb_wrapper_cls.start_server.return_value = True
+  mock_adb_wrapper_cls.devices.return_value = [_make_mock_device("DEV1")]
+  mock_is_installed.return_value = False
+  mock_is_xiaomi.return_value = False
+  mock_install.return_value = True
+  mock_launch.return_value = True
+  mock_wait_results.return_value = "/sdcard/hubble/results"
+  mock_extract_results.return_value = "/tmp/out/DEV1"
+
+  with pytest.raises(SystemExit) as exc_info:
+    automate_observation.main()
+  assert exc_info.value.code == 1
+
+  mock_prefetch.assert_not_called()
+  mock_perform_check.assert_not_called()
+
+
+@mock.patch("automate_observation.extract_apks_from_device")
+def test_classify_dir_pull_preinstalled_only_fails_loudly_when_file_missing(
+    mock_extract_apks: mock.MagicMock, tmp_path: Path
+):
+  """Verifies classify_dir_using_build_fingerprint fails loudly if preinstalled_packages.txt is absent."""
+  build_json_content = json.dumps({
+      "version": "2.0.1",
+      "buildInfo": [{"fingerprint": "google/lynx/lynx:15/BP1A/123:user/release-keys"}],
+  })
+
+  def fake_pull(src, dst):
+    if src.endswith("build.txt"):
+      Path(dst).write_text(build_json_content)
+      return True
+    # Simulate Hubble < 2.1.0 pull: creates results/packages.txt, NOT preinstalled_packages.txt
+    res_dir = Path(dst) / "results"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    (res_dir / "packages.txt").write_text(json.dumps({"packages": []}))
+    return True
+
+  mock_adb = mock.Mock()
+  mock_adb.pull.side_effect = fake_pull
+  logger = mock.Mock()
+
+  result_dir = automate_observation.classify_dir_using_build_fingerprint(
+      mock_adb,
+      "/sdcard/hubble/results",
+      str(tmp_path),
+      extract_apks=True,
+      logger=logger,
+      pull_preinstalled_only=True,
+  )
+
+  assert result_dir is None
+  logger.error.assert_called_once()
+  mock_extract_apks.assert_not_called()
 
 
 if __name__ == "__main__":

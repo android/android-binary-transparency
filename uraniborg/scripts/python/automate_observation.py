@@ -73,14 +73,27 @@ def parse_arguments() -> argparse.Namespace:
                            "APKs from the device. The resulting APKs will be "
                            "stored in an \"apks\" directory within the "
                            "specific numbered results directory.")
+  parser.add_argument("--pull-preinstalled-apks-only", required=False,
+                      action="store_true",
+                      help="If specified, only pre-installed packages (from "
+                           "preinstalled_packages.txt) will be extracted "
+                           "from the device.")
   parser.add_argument("--perform_inclusion_proof_check", required=False,
                       action="store_true",
                       help="If specified, after pulling results, perform "
                            "inclusion proof check for each package APK split "
                            "and write results to "
-                           "packages_with_inclusion_proof_signal.txt. By "
+                           "packages_with_inclusion_proof_signal.txt (or "
+                           "preinstalled_packages_with_inclusion_proof_signal.txt "
+                           "when --check_preinstalled_only is set). By "
                            "default, transparency log entries are pre-fetched "
                            "and cached locally beforehand.")
+  parser.add_argument("--check_preinstalled_only", required=False,
+                      action="store_true",
+                      help="If specified, performs inclusion proof checks "
+                           "against preinstalled_packages.txt instead of "
+                           "packages.txt and writes results to "
+                           "preinstalled_packages_with_inclusion_proof_signal.txt.")
   parser.add_argument("--verifier_path", required=False,
                       help="Path to verifier executable, used if "
                            "--perform_inclusion_proof_check is specified.")
@@ -407,7 +420,8 @@ def _retry_apk_extraction(adb_wrapper: syscall_wrapper.AdbWrapper,
 def extract_apks_from_device(adb_wrapper: syscall_wrapper.AdbWrapper,
                              packages_file_path: str,
                              apks_dir: str,
-                             logger: logging.Logger) -> dict[str, str]:
+                             logger: logging.Logger,
+                             preinstalled_only: bool = False) -> dict[str, str]:
   """Extracts APKs from device according to a list.
 
   APKs that are enumerated in a config (JSON) file are extracted
@@ -421,6 +435,8 @@ def extract_apks_from_device(adb_wrapper: syscall_wrapper.AdbWrapper,
     apks_dir: The umbrella apks/ directory where apps will be
               extracted into.
     logger: A logger object to log debug or error messages.
+    preinstalled_only: Whether the input file is preinstalled_packages.txt
+                       (expects 'preinstalledPackages' key instead of 'packages').
 
   Returns:
     A dictionary listing APKs that failed to be extracted. An empty dict is
@@ -445,9 +461,16 @@ def extract_apks_from_device(adb_wrapper: syscall_wrapper.AdbWrapper,
     packages_buff = f_in.read()
   packages_json = json.loads(packages_buff)
 
+  expected_key = "preinstalledPackages" if preinstalled_only else "packages"
+  packages_list = packages_json.get(expected_key)
+  if not isinstance(packages_list, list):
+    logger.error("No valid '%s' list found in %s.",
+                 expected_key, packages_file_path)
+    return dict()
+
   failed_packages_dict = dict()
   extracted_count = 0
-  for package_json in packages_json["packages"]:
+  for package_json in packages_list:
     package_name = package_json["name"]
 
     package_install_location = package_json["installLocation"]
@@ -489,12 +512,16 @@ def write_dict_as_json_to_file(in_dict, file_path: str):
     f_out.write(json.dumps(in_dict, indent=2))
 
 
+# TODO: Rename/simplify classify_dir_using_build_fingerprint and remove
+# references to "renewed method" vs. legacy ADB-format result categorization,
+# as legacy categorization of Uraniborg results is no longer supported.
 def classify_dir_using_build_fingerprint(
     adb_wrapper: syscall_wrapper.AdbWrapper,
     source: str,
     results_dir: str,
     extract_apks: bool,
-    logger: logging.Logger) -> Optional[str]:
+    logger: logging.Logger,
+    pull_preinstalled_only: bool = False) -> Optional[str]:
   """Decides which directory in results/ to dump new result to.
 
   This is a renewed method that makes use of build fingerprint to do
@@ -508,6 +535,8 @@ def classify_dir_using_build_fingerprint(
     extract_apks: A boolean indicating whether or not to also extract the APKs
                   from the target device.
     logger: A logger object to log debug or error messages.
+    pull_preinstalled_only: A boolean indicating whether to only extract APKs
+                            listed in preinstalled_packages.txt.
 
   Returns:
     A string representing the final directory (on host) where results are pulled
@@ -580,15 +609,25 @@ def classify_dir_using_build_fingerprint(
     apks_dir = os.path.abspath(os.path.join(target_dir, "apks"))
     os.makedirs(apks_dir)
 
+  pkg_filename = "preinstalled_packages.txt" if pull_preinstalled_only else "packages.txt"
+  pkg_file_path = os.path.join(target_dir, "results", pkg_filename)
+
   if adb_pull_failed:
     source_dir = os.path.join("/tmp/untarred_hubble_results/apps",
                               HUBBLE_PACKAGE_NAME,
                               "ef",
                               "results")
     shutil.move(source_dir, target_dir)
+    if pull_preinstalled_only and not os.path.exists(pkg_file_path):
+      logger.error(
+          "preinstalled_packages.txt not found in %s. "
+          "--pull-preinstalled-apks-only requires Hubble >= 2.1.0.",
+          os.path.join(target_dir, "results"))
+      return None
     failed_extraction_dict = extract_apks_from_device(
-        adb_wrapper, os.path.join(target_dir, "results", "packages.txt"),
-        apks_dir, logger)
+        adb_wrapper, pkg_file_path,
+        apks_dir, logger,
+        preinstalled_only=pull_preinstalled_only)
     if failed_extraction_dict:
       write_dict_as_json_to_file(failed_extraction_dict,
                                  os.path.join(apks_dir,
@@ -596,10 +635,17 @@ def classify_dir_using_build_fingerprint(
     return target_dir
   else:
     if adb_wrapper.pull(source, target_dir):
+      if pull_preinstalled_only and not os.path.exists(pkg_file_path):
+        logger.error(
+            "preinstalled_packages.txt not found in %s. "
+            "--pull-preinstalled-apks-only requires Hubble >= 2.1.0.",
+            os.path.join(target_dir, "results"))
+        return None
       failed_extraction_dict = extract_apks_from_device(
-          adb_wrapper, os.path.join(target_dir, "results", "packages.txt"),
+          adb_wrapper, pkg_file_path,
           apks_dir,
-          logger)
+          logger,
+          preinstalled_only=pull_preinstalled_only)
       if failed_extraction_dict:
         write_dict_as_json_to_file(failed_extraction_dict,
                                    os.path.join(apks_dir,
@@ -612,7 +658,8 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
                              source: str,
                              destination: str,
                              logger: logging.Logger,
-                             extract_apks=False) -> Optional[str]:
+                             extract_apks=False,
+                             pull_preinstalled_only=False) -> Optional[str]:
   """Extracts results (and optionally APKs) from Hubble's execution.
 
   Args:
@@ -622,6 +669,8 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
     logger: A logger object to log debug or error messages.
     extract_apks: A boolean indicating whether to also extract APKs from the
                   device or not. This is defaulted to False.
+    pull_preinstalled_only: A boolean indicating whether to only extract APKs
+                            from preinstalled_packages.txt.
 
   Returns:
     A string representing the final directory (on host) where results are copied
@@ -653,7 +702,8 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
                                               source,
                                               results_dir,
                                               extract_apks,
-                                              logger)
+                                              logger,
+                                              pull_preinstalled_only=pull_preinstalled_only)
 
 
 def extract_selinux_policies(adb_wrapper: syscall_wrapper.AdbWrapper,
@@ -776,9 +826,9 @@ def main():
       return
     gradlew_path = os.path.join(hubble_project_dir, "gradlew")
 
-    logger.info("Running 'gradlew assemble' in %s", hubble_project_dir)
+    logger.info("Running 'gradlew assembleDebug' in %s", hubble_project_dir)
     sw = SyscallWrapper(logger)
-    sw.call_returnable_command([gradlew_path, "assemble"], cwd=hubble_project_dir)
+    sw.call_returnable_command([gradlew_path, "assembleDebug"], cwd=hubble_project_dir)
     if sw.error_occured:
       logger.error("Failed to (re)build Hubble APK: [%d] %s", sw.return_code, sw.error_message)
       return
@@ -829,6 +879,8 @@ def main():
 
   results = {}
   prefetched = False
+  has_errors = False
+  verification_failed_devices = set()
   for target_device in connected_devices:
     if target_device.unauthorized:
       logger.error("Please authorize device with serial number %s for ADB via "
@@ -869,12 +921,14 @@ def main():
     if not results_source:
       logger.error("Failed to obtain results from Hubble execution.")
       continue
-    extract_apks = args.pull_all_apks is not None
-    results_dir = extract_results_and_apks(adb_wrapper,
-                                           results_source,
-                                           args.output,
-                                           logger,
-                                           extract_apks)
+    extract_apks = (args.pull_all_apks is not None) or args.pull_preinstalled_apks_only
+    results_dir = extract_results_and_apks(
+        adb_wrapper,
+        results_source,
+        args.output,
+        logger,
+        extract_apks,
+        pull_preinstalled_only=args.pull_preinstalled_apks_only)
 
     if not results_dir:
       logger.error("Failed to extract results from target device (%s).",
@@ -885,7 +939,20 @@ def main():
     results[target_device.serial_number] = results_dir
 
     if args.perform_inclusion_proof_check:
-      packages_txt_path = os.path.join(results_dir, "results", "packages.txt")
+      pkg_filename = (
+          "preinstalled_packages.txt"
+          if args.check_preinstalled_only
+          else "packages.txt"
+      )
+      packages_txt_path = os.path.join(results_dir, "results", pkg_filename)
+      if args.check_preinstalled_only and not os.path.isfile(packages_txt_path):
+        logger.error(
+            "preinstalled_packages.txt not found at %s (extracted results at %s). "
+            "--check_preinstalled_only requires Hubble >= 2.1.0.",
+            packages_txt_path, results_dir)
+        has_errors = True
+        verification_failed_devices.add(target_device.serial_number)
+        continue
       if (not args.no_prefetch and not prefetched and
           os.path.isfile(packages_txt_path)):
         prefetched = inclusion_proof_check.prefetch_log_entries(
@@ -894,19 +961,31 @@ def main():
             cache_dir=args.cache_dir,
             concurrency=args.cache_prefetch_concurrency,
             timeout=args.cache_prefetch_timeout)
-      inclusion_proof_check.perform_inclusion_proof_check(
+      if not inclusion_proof_check.perform_inclusion_proof_check(
           args.verifier_path,
           packages_txt_path,
           logger,
           cache_dir=args.cache_dir,
           concurrency=args.cache_prefetch_concurrency,
           timeout=args.cache_prefetch_timeout,
-          prefetch=False)
+          prefetch=False,
+          preinstalled_only=args.check_preinstalled_only):
+        has_errors = True
+        verification_failed_devices.add(target_device.serial_number)
 
   for device in results:
-    logger.info("SUCCESS! Hubble was successfully deployed and executed on "
-                "connected device %s.", device)
+    if device in verification_failed_devices:
+      logger.warning(
+          "PARTIAL SUCCESS: Hubble data collection succeeded on connected "
+          "device %s, but inclusion proof verification failed (exiting 1).",
+          device)
+    else:
+      logger.info("SUCCESS! Hubble was successfully deployed and executed on "
+                  "connected device %s.", device)
     logger.info("Hubble output files can be found at: %s", results[device])
+
+  if has_errors:
+    sys.exit(1)
 
 
 if __name__ == "__main__":
