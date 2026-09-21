@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/mod/sumdb/tlog"
@@ -754,5 +755,100 @@ func TestTesseraCacheShardingAndTargetedEviction(t *testing.T) {
 	deepTilePath := filepath.Join(customDir, logDir, "tile", "entries", "x001", "x234", "067")
 	if info, err := os.Stat(deepTilePath); err != nil || info.IsDir() {
 		t.Errorf("expected deep sharded tile at %s, err: %v", deepTilePath, err)
+	}
+}
+
+func TestLegacyCacheEviction(t *testing.T) {
+	customDir := t.TempDir()
+	SetCacheDir(customDir)
+	defer SetCacheDir("")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/package_info.txt" {
+			w.Write([]byte("0\nhash0\nhash_desc0\npkg0\n1\n"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	logDir := LogDirFromURL(server.URL)
+	targetDir := filepath.Join(customDir, logDir)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatalf("failed to create targetDir: %v", err)
+	}
+
+	now := time.Now()
+	expiredTime := now.Add(-25 * time.Hour)
+	orphanedTmpTime := now.Add(-2 * time.Hour)
+	recentTime := now.Add(-10 * time.Minute)
+
+	// 1. Expired cache file (> 24h old) -> should be deleted
+	expiredCache := filepath.Join(targetDir, "package_info.txt_1")
+	if err := os.WriteFile(expiredCache, []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(expiredCache, expiredTime, expiredTime)
+
+	// 2. Recent cache file (< 24h old) -> should be kept
+	recentCache := filepath.Join(targetDir, "package_info.txt_2")
+	if err := os.WriteFile(recentCache, []byte("recent"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(recentCache, recentTime, recentTime)
+
+	// 3. Orphaned temp file (> 1h old) -> should be deleted
+	orphanedTmp := filepath.Join(targetDir, "package_info.txt_1.12345.tmp")
+	if err := os.WriteFile(orphanedTmp, []byte("tmp_old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(orphanedTmp, orphanedTmpTime, orphanedTmpTime)
+
+	// 4. Active temp file (< 1h old) -> should be kept
+	activeTmp := filepath.Join(targetDir, "package_info.txt_2.67890.tmp")
+	if err := os.WriteFile(activeTmp, []byte("tmp_active"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(activeTmp, recentTime, recentTime)
+
+	// 5. Unrelated expired file -> should be kept
+	otherExpired := filepath.Join(targetDir, "package_info2.txt_1")
+	if err := os.WriteFile(otherExpired, []byte("other"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(otherExpired, expiredTime, expiredTime)
+
+	// 6. Same-named file in parent cache root (customDir) -> must NOT be deleted
+	rootCollisionFile := filepath.Join(customDir, "package_info.txt_1")
+	if err := os.WriteFile(rootCollisionFile, []byte("root_file"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger download and cleanup for package_info.txt at treeSize = 3
+	if _, err := readCachedInfoFileContext(context.Background(), server.URL, "package_info.txt", 3); err != nil {
+		t.Fatalf("readCachedInfoFileContext failed: %v", err)
+	}
+
+	if _, err := os.Stat(expiredCache); !os.IsNotExist(err) {
+		t.Errorf("expected expired cache file %s to be deleted, err: %v", expiredCache, err)
+	}
+	if _, err := os.Stat(orphanedTmp); !os.IsNotExist(err) {
+		t.Errorf("expected orphaned temp file %s to be deleted, err: %v", orphanedTmp, err)
+	}
+	if _, err := os.Stat(recentCache); err != nil {
+		t.Errorf("expected recent cache file %s to be preserved, err: %v", recentCache, err)
+	}
+	if _, err := os.Stat(activeTmp); err != nil {
+		t.Errorf("expected active temp file %s to be preserved, err: %v", activeTmp, err)
+	}
+	if _, err := os.Stat(otherExpired); err != nil {
+		t.Errorf("expected unrelated file %s to be preserved, err: %v", otherExpired, err)
+	}
+	if _, err := os.Stat(rootCollisionFile); err != nil {
+		t.Errorf("expected parent root file %s to not be deleted across directories, err: %v", rootCollisionFile, err)
+	}
+	newCache := filepath.Join(targetDir, "package_info.txt_3")
+	if _, err := os.Stat(newCache); err != nil {
+		t.Errorf("expected newly downloaded cache file %s to exist, err: %v", newCache, err)
 	}
 }

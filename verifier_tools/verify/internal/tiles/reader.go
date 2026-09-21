@@ -261,7 +261,7 @@ func readCachedInfoFileContext(ctx context.Context, logBaseURL string, binaryInf
 				continue
 			}
 
-			f := filepath.Join(abtCacheDir, entry.Name())
+			f := filepath.Join(targetDir, entry.Name())
 			if f == cachePath {
 				continue
 			}
