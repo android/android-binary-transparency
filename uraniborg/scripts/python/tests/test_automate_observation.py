@@ -777,7 +777,9 @@ def test_main_multi_device_error_isolation_across_stages(
   # 2 devices reach extract_results_and_apks: DEV_EXTRACT_FAIL returns None, DEV_OK succeeds
   mock_extract_results.side_effect = [None, "/tmp/out/DEV_OK"]
 
-  automate_observation.main()
+  with pytest.raises(SystemExit) as exc_info:
+    automate_observation.main()
+  assert exc_info.value.code == 1
 
   # Verify exact call counts at each pipeline stage (ensuring all side_effects were consumed)
   assert mock_adb_wrapper_cls.call_count == 7
@@ -819,6 +821,22 @@ def test_main_multi_device_error_isolation_across_stages(
       "Failed to extract results from target device (%s).",
       "DEV_EXTRACT_FAIL",
   )
+
+  # Verify all 7 failed devices appear in the final summary with FAILED lines
+  for failed_serial in [
+      "DEV_UNAUTH",
+      "DEV_UNINSTALL_FAIL",
+      "DEV_INSTALL_FAIL",
+      "DEV_INSTALL_RC_FAIL",
+      "DEV_LAUNCH_FAIL",
+      "DEV_WAIT_FAIL",
+      "DEV_EXTRACT_FAIL",
+  ]:
+    mock_logger.error.assert_any_call(
+        "FAILED: Hubble data collection failed on connected device %s "
+        "(exiting 1).",
+        failed_serial,
+    )
 
   # Only DEV_OK should reach final SUCCESS logging
   mock_logger.info.assert_any_call(
@@ -1413,6 +1431,226 @@ def test_extract_selinux_policies_item_by_item_and_partial_failures(
   logger.warning.assert_any_call(
       "Failed to pull %s. Continuing...",
       "/system/etc/selinux/plat_sepolicy.cil",
+  )
+
+
+def test_is_xiaomi_phone_handles_malformed_getprop_and_detects_xiaomi():
+  """Verifies is_xiaomi_phone ignores malformed getprop lines without ': ' and preserves values containing ': '."""
+  logger = mock.Mock()
+  mock_adb = mock.Mock()
+
+  # 1. adb shell getprop failure returns False
+  mock_adb.shell.return_value = False
+  assert automate_observation.is_xiaomi_phone(mock_adb, logger) is False
+
+  # 2. Malformed lines containing 'oem' or 'brand' without ': ' do not raise IndexError
+  mock_adb.shell.return_value = True
+  mock_adb.get_result.return_value = [
+      "[ro.product.oem_multiline_without_colon]",
+      "warning: brand property truncated without colon",
+      "",
+      "[ro.product.brand]: [google]",
+      "[ro.product.oem]: [pixel]",
+  ]
+  assert automate_observation.is_xiaomi_phone(mock_adb, logger) is False
+
+  # 3. Detects Xiaomi in brand after skipping malformed lines, even when value contains ': '
+  mock_adb.get_result.return_value = [
+      "oem line without colon delimiter",
+      "[ro.product.brand]: [sub-brand: Xiaomi]",
+  ]
+  assert automate_observation.is_xiaomi_phone(mock_adb, logger) is True
+
+  # 4. Detects Xiaomi in oem property when value contains ': '
+  mock_adb.get_result.return_value = [
+      "brand line without colon delimiter",
+      "[ro.oem.key1]: [vendor: xiaomi_global]",
+  ]
+  assert automate_observation.is_xiaomi_phone(mock_adb, logger) is True
+
+
+def test_is_hubble_installed_detection_and_runtime_error():
+  """Verifies is_hubble_installed package detection and RuntimeError on ADB shell failure."""
+  logger = mock.Mock()
+  mock_adb = mock.Mock()
+
+  # 1. Raises RuntimeError when pm list packages fails
+  mock_adb.shell.return_value = False
+  with pytest.raises(RuntimeError, match="Querying for Hubble installation failed."):
+    automate_observation.is_hubble_installed(mock_adb, logger)
+
+  # 2. Returns True when com.uraniborg.hubble is present
+  mock_adb.shell.return_value = True
+  mock_adb.get_result.return_value = [
+      "package:com.android.settings",
+      "package:com.uraniborg.hubble",
+  ]
+  assert automate_observation.is_hubble_installed(mock_adb, logger) is True
+
+  # 3. Returns False when com.uraniborg.hubble is absent
+  mock_adb.get_result.return_value = [
+      "package:com.android.settings",
+  ]
+  assert automate_observation.is_hubble_installed(mock_adb, logger) is False
+
+
+@mock.patch("automate_observation.os.path.isfile", return_value=True)
+@mock.patch("inclusion_proof_check.prefetch_log_entries", return_value=True)
+@mock.patch("inclusion_proof_check.perform_inclusion_proof_check")
+@mock.patch("automate_observation.set_up_logging")
+@mock.patch("automate_observation.extract_selinux_policies")
+@mock.patch("automate_observation.extract_results_and_apks")
+@mock.patch("automate_observation.wait_for_results", return_value="/sdcard/hubble/results")
+@mock.patch("automate_observation.launch_hubble", return_value=True)
+@mock.patch("automate_observation.clear_logcat")
+@mock.patch("automate_observation.install_hubble", return_value=True)
+@mock.patch("automate_observation.AdbWrapper")
+@mock.patch("automate_observation.adb_installed", return_value=True)
+@mock.patch("automate_observation.verify_hubble", return_value=True)
+@mock.patch("automate_observation.supported_platform", return_value=True)
+def test_main_multi_device_exception_isolation_and_exit_code(
+    mock_supported: mock.MagicMock,
+    mock_verify_hubble: mock.MagicMock,
+    mock_adb_installed: mock.MagicMock,
+    mock_adb_wrapper_cls: mock.MagicMock,
+    mock_install: mock.MagicMock,
+    mock_clear_logcat: mock.MagicMock,
+    mock_launch: mock.MagicMock,
+    mock_wait_results: mock.MagicMock,
+    mock_extract_results: mock.MagicMock,
+    mock_extract_selinux: mock.MagicMock,
+    mock_set_up_logging: mock.MagicMock,
+    mock_perform_check: mock.MagicMock,
+    mock_prefetch: mock.MagicMock,
+    mock_isfile: mock.MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+  """Verifies pre- and post-collection exceptions isolate per device, log tracebacks, and report distinct summaries."""
+  monkeypatch.setattr(
+      sys,
+      "argv",
+      [
+          "automate_observation.py",
+          "-H",
+          "/path/to/hubble.apk",
+          "-o",
+          "/tmp/out",
+          "--perform_inclusion_proof_check",
+          "--verifier_path=/path/to/verifier",
+      ],
+  )
+  mock_logger = mock.Mock()
+  mock_set_up_logging.return_value = mock_logger
+
+  mock_adb_wrapper_cls.start_server.return_value = True
+  mock_adb_wrapper_cls.devices.return_value = [
+      _make_mock_device("DEV1"),
+      _make_mock_device("DEV2"),
+      _make_mock_device("DEV_POST_ERR"),
+      _make_mock_device("DEV3"),
+  ]
+
+  def make_adb_wrapper(serial: str, _logger):
+    wrapper = mock.Mock()
+    wrapper.serial_number = serial
+    wrapper.error_message = ""
+    if serial == "DEV1":
+      # DEV1: pm list packages fails -> is_hubble_installed raises RuntimeError
+      wrapper.shell.return_value = False
+    else:
+      # DEV2, DEV_POST_ERR, DEV3: pm list packages succeeds (not installed),
+      # getprop includes malformed lines without ': '
+      wrapper.shell.return_value = True
+      wrapper.get_result.side_effect = [
+          ["package:com.android.settings"],
+          [
+              "malformed oem line without colon",
+              "malformed brand line without colon",
+              "[ro.product.brand]: [google]",
+          ],
+      ]
+    return wrapper
+
+  mock_adb_wrapper_cls.side_effect = make_adb_wrapper
+
+  json_err = json.JSONDecodeError("Expecting value", "", 0)
+  post_collection_err = OSError("unexpected disk error during check")
+
+  # DEV2 raises a pre-collection parsing exception; DEV_POST_ERR and DEV3 succeed collection
+  mock_extract_results.side_effect = [
+      json_err,
+      "/tmp/out/DEV_POST_ERR",
+      "/tmp/out/DEV3",
+  ]
+  # DEV_POST_ERR raises an OSError after results["DEV_POST_ERR"] is recorded; DEV3 succeeds
+  mock_perform_check.side_effect = [post_collection_err, True]
+
+  with pytest.raises(SystemExit) as exc_info:
+    automate_observation.main()
+  assert exc_info.value.code == 1
+
+  # DEV1 failed in is_hubble_installed; DEV2, DEV_POST_ERR, DEV3 reached extract_results_and_apks
+  assert mock_extract_results.call_count == 3
+  assert mock_extract_selinux.call_count == 2
+
+  # Verify logger.exception was called with the exact format string and serial numbers
+  assert mock_logger.exception.call_count == 3
+  exc_calls = [call.args for call in mock_logger.exception.call_args_list]
+  assert (
+      exc_calls[0][0] == "Unexpected error while processing device %s: %s"
+      and exc_calls[0][1] == "DEV1"
+      and isinstance(exc_calls[0][2], RuntimeError)
+  )
+  assert exc_calls[1] == (
+      "Unexpected error while processing device %s: %s",
+      "DEV2",
+      json_err,
+  )
+  assert exc_calls[2] == (
+      "Unexpected error while processing device %s: %s",
+      "DEV_POST_ERR",
+      post_collection_err,
+  )
+
+  # Verify pre-collection exception devices (DEV1, DEV2) appear in the summary with FAILED lines
+  for failed_serial in ["DEV1", "DEV2"]:
+    mock_logger.error.assert_any_call(
+        "FAILED: Hubble data collection failed on connected device %s "
+        "(exiting 1).",
+        failed_serial,
+    )
+
+  # Verify DEV_POST_ERR logs the post-collection error summary, NOT verification_failed_devices or FAILED
+  mock_logger.warning.assert_any_call(
+      "PARTIAL SUCCESS: Hubble data collection succeeded on connected "
+      "device %s, but an unexpected error occurred during post-collection "
+      "processing (exiting 1).",
+      "DEV_POST_ERR",
+  )
+  for call in mock_logger.warning.call_args_list:
+    assert call.args != (
+        "PARTIAL SUCCESS: Hubble data collection succeeded on connected "
+        "device %s, but inclusion proof verification failed (exiting 1).",
+        "DEV_POST_ERR",
+    )
+  for call in mock_logger.error.call_args_list:
+    assert call.args != (
+        "FAILED: Hubble data collection failed on connected device %s "
+        "(exiting 1).",
+        "DEV_POST_ERR",
+    )
+  mock_logger.info.assert_any_call(
+      "Hubble output files can be found at: %s", "/tmp/out/DEV_POST_ERR"
+  )
+
+  # Verify DEV3 still completed and logged SUCCESS summary
+  mock_logger.info.assert_any_call(
+      "SUCCESS! Hubble was successfully deployed and executed on "
+      "connected device %s.",
+      "DEV3",
+  )
+  mock_logger.info.assert_any_call(
+      "Hubble output files can be found at: %s", "/tmp/out/DEV3"
   )
 
 
