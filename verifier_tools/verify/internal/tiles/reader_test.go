@@ -303,39 +303,114 @@ func TestParseEntryBundle(t *testing.T) {
 }
 
 func TestTesseraFindPayloadIndex(t *testing.T) {
-	entry0 := []byte("hash0\nhash_desc0\npackage_name0\n100\n")
-	entry1 := []byte("hash1\nhash_desc1\npackage_name1\n101\n")
+	tempDir := t.TempDir()
+	t.Setenv("HOME", tempDir)
+	t.Setenv("XDG_CACHE_HOME", tempDir)
 
-	var buf bytes.Buffer
-	buf.Write([]byte{0x00, byte(len(entry0))})
-	buf.Write(entry0)
-	buf.Write([]byte{0x00, byte(len(entry1))})
-	buf.Write(entry1)
+	crossTileDupPayload := []byte("hash_dup_cross\nhash_desc_dup\npackage_name_dup\n999\n")
+	intraTileDupPayload := []byte("hash_dup_intra\nhash_desc_dup\npackage_name_intra\n888\n")
+
+	var tile0Entries [][]byte
+	for i := 0; i < 256; i++ {
+		switch i {
+		case 10:
+			tile0Entries = append(tile0Entries, crossTileDupPayload)
+		case 20, 200:
+			tile0Entries = append(tile0Entries, intraTileDupPayload)
+		default:
+			tile0Entries = append(tile0Entries, []byte(fmt.Sprintf("hash0_%d\nhash_desc0\npackage_name0\n%d\n", i, i)))
+		}
+	}
+	tile0Data := createTestEntryBundle(tile0Entries)
+
+	// Tile 1 contains crossTileDupPayload at index 256 (tile1[0]) and entry257 at index 257 (tile1[1]).
+	entry257 := []byte("hash1_1\nhash_desc1\npackage_name1\n257\n")
+	tile1Data := createTestEntryBundle([][]byte{crossTileDupPayload, entry257})
+
+	var tile0Requests atomic.Int64
+	var tile1Requests atomic.Int64
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/tile/entries/000.p/2" {
-			w.Write(buf.Bytes())
-			return
+		switch r.URL.Path {
+		case "/tile/entries/000":
+			tile0Requests.Add(1)
+			w.Write(tile0Data)
+		case "/tile/entries/001.p/2":
+			tile1Requests.Add(1)
+			w.Write(tile1Data)
+		default:
+			http.NotFound(w, r)
 		}
-		http.NotFound(w, r)
 	}))
 	defer server.Close()
 
-	idx, found, err := TesseraFindPayloadIndex(server.URL, 2, entry1)
+	// Searching for an entry in the latest tile (tile 1) should scan in reverse
+	// and find it without downloading tile 0.
+	idx, found, err := TesseraFindPayloadIndex(server.URL, 258, entry257)
 	if err != nil {
 		t.Fatalf("TesseraFindPayloadIndex error: %v", err)
 	}
-	if !found || idx != 1 {
-		t.Errorf("got (%d, %v), want (1, true)", idx, found)
+	if !found || idx != 257 {
+		t.Errorf("got (%d, %v), want (257, true)", idx, found)
+	}
+	if tile1Requests.Load() != 1 {
+		t.Errorf("expected 1 request for tile 1, got %d", tile1Requests.Load())
+	}
+	if tile0Requests.Load() != 0 {
+		t.Errorf("expected 0 requests for tile 0 when target is in latest tile, got %d", tile0Requests.Load())
 	}
 
-	// Search for non-existent payload
-	idx, found, err = TesseraFindPayloadIndex(server.URL, 2, []byte("non_existent"))
+	// Duplicate across tiles (present at index 10 in tile 0 and index 256 in tile 1)
+	// must resolve to the highest index (256) without needing to fetch tile 0.
+	idx, found, err = TesseraFindPayloadIndex(server.URL, 258, crossTileDupPayload)
+	if err != nil {
+		t.Fatalf("TesseraFindPayloadIndex cross-tile duplicate error: %v", err)
+	}
+	if !found || idx != 256 {
+		t.Errorf("cross-tile duplicate payload got (%d, %v), want highest index (256, true)", idx, found)
+	}
+	if tile0Requests.Load() != 0 {
+		t.Errorf("expected 0 requests for tile 0 when duplicate resolves in tile 1, got %d", tile0Requests.Load())
+	}
+
+	// Searching for an entry in an older tile (tile 0) should fall back to tile 0
+	// while serving tile 1 from cache without re-downloading it.
+	idx, found, err = TesseraFindPayloadIndex(server.URL, 258, tile0Entries[42])
+	if err != nil {
+		t.Fatalf("TesseraFindPayloadIndex error: %v", err)
+	}
+	if !found || idx != 42 {
+		t.Errorf("got (%d, %v), want (42, true)", idx, found)
+	}
+	if tile1Requests.Load() != 1 {
+		t.Errorf("expected tile 1 to be served from cache (1 request total), got %d", tile1Requests.Load())
+	}
+	if tile0Requests.Load() != 1 {
+		t.Errorf("expected 1 request for tile 0, got %d", tile0Requests.Load())
+	}
+
+	// Duplicate within a single tile (present at indices 20 and 200 in tile 0)
+	// must resolve to the higher index (200) via the reverse inner-loop scan.
+	idx, found, err = TesseraFindPayloadIndex(server.URL, 258, intraTileDupPayload)
+	if err != nil {
+		t.Fatalf("TesseraFindPayloadIndex intra-tile duplicate error: %v", err)
+	}
+	if !found || idx != 200 {
+		t.Errorf("intra-tile duplicate payload got (%d, %v), want highest index (200, true)", idx, found)
+	}
+
+	// Search for non-existent payload across all tiles; both tiles must be served
+	// from cache with zero additional HTTP requests.
+	idx, found, err = TesseraFindPayloadIndex(server.URL, 258, []byte("non_existent"))
 	if err != nil {
 		t.Fatalf("TesseraFindPayloadIndex error: %v", err)
 	}
 	if found {
 		t.Errorf("expected found=false for non-existent payload, got %d", idx)
+	}
+	if tile1Requests.Load() != 1 || tile0Requests.Load() != 1 {
+		t.Errorf("expected cached tiles to not be re-downloaded (want 1, 1), got (%d, %d)",
+			tile1Requests.Load(), tile0Requests.Load())
 	}
 }
 
@@ -681,4 +756,3 @@ func TestTesseraCacheShardingAndTargetedEviction(t *testing.T) {
 		t.Errorf("expected deep sharded tile at %s, err: %v", deepTilePath, err)
 	}
 }
-
