@@ -28,6 +28,7 @@ import os
 import shutil  # to help move files
 import sys
 import tarfile  # to untar decompressed adb backup file
+import tempfile
 from typing import Optional  # runtime support for type hints.
 import zlib  # to decompress adb backup
 
@@ -305,7 +306,6 @@ def install_hubble(adb_wrapper: syscall_wrapper.AdbWrapper,
     adb_wrapper: An AdbWrapper object that is used to issue ADB commands.
     args: The arguments object used in the following way:
           .hubble: To be read from to determine hubble's path
-          .error_message: To be written to in case of errors.
     logger: A logger object to log debug or error messages.
 
   Returns:
@@ -313,15 +313,21 @@ def install_hubble(adb_wrapper: syscall_wrapper.AdbWrapper,
   """
   hubble_abs_path = os.path.abspath(args.hubble)
   if not os.path.exists(hubble_abs_path):
-    logger.error("{} does not exist!".format(args.hubble))
+    msg = "{} does not exist!".format(args.hubble)
+    logger.error(msg)
+    adb_wrapper.error_message = msg
     return False
 
   if not os.path.isfile(hubble_abs_path):
-    logger.error("{} is not a file".format(args.hubble))
+    msg = "{} is not a file".format(args.hubble)
+    logger.error(msg)
+    adb_wrapper.error_message = msg
     return False
 
   # do the actual installation by calling adb install
   if not adb_wrapper.install(hubble_abs_path):
+    if not getattr(adb_wrapper, "error_message", None):
+      adb_wrapper.error_message = "adb install failed"
     return False
 
   # sometimes, the return code states that installation is successful, but
@@ -329,7 +335,7 @@ def install_hubble(adb_wrapper: syscall_wrapper.AdbWrapper,
   for l in adb_wrapper.get_result():
     logger.debug("installation result: {}".format(l))
     if "fail" in l.lower():
-      args.error_message = l.strip()
+      adb_wrapper.error_message = l.strip()
       return False
 
   return True
@@ -459,7 +465,15 @@ def extract_apks_from_device(adb_wrapper: syscall_wrapper.AdbWrapper,
   packages_buff = ""
   with open(packages_file_path, "r") as f_in:
     packages_buff = f_in.read()
-  packages_json = json.loads(packages_buff)
+  try:
+    packages_json = json.loads(packages_buff)
+  except json.JSONDecodeError:
+    logger.error("Failed to parse JSON from %s.", packages_file_path)
+    return dict()
+
+  if not isinstance(packages_json, dict):
+    logger.error("Expected a JSON object in %s.", packages_file_path)
+    return dict()
 
   expected_key = "preinstalledPackages" if preinstalled_only else "packages"
   packages_list = packages_json.get(expected_key)
@@ -471,6 +485,12 @@ def extract_apks_from_device(adb_wrapper: syscall_wrapper.AdbWrapper,
   failed_packages_dict = dict()
   extracted_count = 0
   for package_json in packages_list:
+    if (not isinstance(package_json, dict) or
+        "name" not in package_json or
+        "installLocation" not in package_json):
+      logger.error("Malformed package entry in %s: %s",
+                   packages_file_path, package_json)
+      continue
     package_name = package_json["name"]
 
     package_install_location = package_json["installLocation"]
@@ -521,7 +541,8 @@ def classify_dir_using_build_fingerprint(
     results_dir: str,
     extract_apks: bool,
     logger: logging.Logger,
-    pull_preinstalled_only: bool = False) -> Optional[str]:
+    pull_preinstalled_only: bool = False,
+    tmp_dir: str = "/tmp") -> Optional[str]:
   """Decides which directory in results/ to dump new result to.
 
   This is a renewed method that makes use of build fingerprint to do
@@ -537,6 +558,8 @@ def classify_dir_using_build_fingerprint(
     logger: A logger object to log debug or error messages.
     pull_preinstalled_only: A boolean indicating whether to only extract APKs
                             listed in preinstalled_packages.txt.
+    tmp_dir: Temporary directory on host used for staging build.txt and
+             adb backup artifacts. Defaults to "/tmp".
 
   Returns:
     A string representing the final directory (on host) where results are pulled
@@ -544,7 +567,8 @@ def classify_dir_using_build_fingerprint(
     way.
   """
   # need to grab the build.txt to a tmp location
-  tmp_file = "/tmp/device_build.txt"
+  tmp_file = os.path.join(tmp_dir, "device_build.txt")
+  base_result_path = os.path.join(tmp_dir, "untarred_hubble_results")
   adb_pull_failed = False
   if not adb_wrapper.pull("{}/build.txt".format(source), tmp_file):
     logger.error("Failed to pull build.txt from device results dir.")
@@ -552,8 +576,8 @@ def classify_dir_using_build_fingerprint(
 
   if adb_pull_failed:
     logger.debug("Attempting to grab files using adb backup instead...")
-    compressed_backup_filepath = "/tmp/hubble_results.ab"
-    decompressed_backup_filepath = "/tmp/hubble_results.tar"
+    compressed_backup_filepath = os.path.join(tmp_dir, "hubble_results.ab")
+    decompressed_backup_filepath = os.path.join(tmp_dir, "hubble_results.tar")
     logger.warning("Manual intervention required: Please select "
                    "`Back up my data` to proceed")
     if not adb_wrapper.backup(compressed_backup_filepath, HUBBLE_PACKAGE_NAME):
@@ -574,9 +598,11 @@ def classify_dir_using_build_fingerprint(
 
     tarfile_obj = io.BytesIO(decompressed_content)
     tar_obj = tarfile.open(fileobj=tarfile_obj)
-    base_result_path = "/tmp/untarred_hubble_results"
     logger.debug("Extracting result files into %s", base_result_path)
-    tar_obj.extractall(base_result_path)
+    if hasattr(tarfile, "data_filter"):
+      tar_obj.extractall(base_result_path, filter="data")
+    else:
+      tar_obj.extractall(base_result_path)
 
     # we overwrite tmp_file to reuse existing logic
     tmp_file = os.path.join(base_result_path, "apps", HUBBLE_PACKAGE_NAME,
@@ -613,7 +639,7 @@ def classify_dir_using_build_fingerprint(
   pkg_file_path = os.path.join(target_dir, "results", pkg_filename)
 
   if adb_pull_failed:
-    source_dir = os.path.join("/tmp/untarred_hubble_results/apps",
+    source_dir = os.path.join(base_result_path, "apps",
                               HUBBLE_PACKAGE_NAME,
                               "ef",
                               "results")
@@ -659,7 +685,8 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
                              destination: str,
                              logger: logging.Logger,
                              extract_apks=False,
-                             pull_preinstalled_only=False) -> Optional[str]:
+                             pull_preinstalled_only=False,
+                             tmp_dir: str = "/tmp") -> Optional[str]:
   """Extracts results (and optionally APKs) from Hubble's execution.
 
   Args:
@@ -671,6 +698,8 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
                   device or not. This is defaulted to False.
     pull_preinstalled_only: A boolean indicating whether to only extract APKs
                             from preinstalled_packages.txt.
+    tmp_dir: Temporary directory on host used for staging build.txt and
+             adb backup artifacts. Defaults to "/tmp".
 
   Returns:
     A string representing the final directory (on host) where results are copied
@@ -703,7 +732,8 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
                                               results_dir,
                                               extract_apks,
                                               logger,
-                                              pull_preinstalled_only=pull_preinstalled_only)
+                                              pull_preinstalled_only=pull_preinstalled_only,
+                                              tmp_dir=tmp_dir)
 
 
 def extract_selinux_policies(adb_wrapper: syscall_wrapper.AdbWrapper,
@@ -922,13 +952,15 @@ def main():
       logger.error("Failed to obtain results from Hubble execution.")
       continue
     extract_apks = (args.pull_all_apks is not None) or args.pull_preinstalled_apks_only
-    results_dir = extract_results_and_apks(
-        adb_wrapper,
-        results_source,
-        args.output,
-        logger,
-        extract_apks,
-        pull_preinstalled_only=args.pull_preinstalled_apks_only)
+    with tempfile.TemporaryDirectory() as device_tmp_dir:
+      results_dir = extract_results_and_apks(
+          adb_wrapper,
+          results_source,
+          args.output,
+          logger,
+          extract_apks,
+          pull_preinstalled_only=args.pull_preinstalled_apks_only,
+          tmp_dir=device_tmp_dir)
 
     if not results_dir:
       logger.error("Failed to extract results from target device (%s).",
