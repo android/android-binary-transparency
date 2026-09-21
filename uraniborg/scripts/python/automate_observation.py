@@ -248,7 +248,11 @@ def is_xiaomi_phone(adb_wrapper: syscall_wrapper.AdbWrapper,
     return False
 
   for line in adb_wrapper.get_result():
-    components = line.split(": ")
+    # Split once on ": "; continuation lines of multi-line properties lack this
+    # delimiter and are intentionally skipped.
+    components = line.split(": ", 1)
+    if len(components) < 2:
+      continue
     if "oem" in components[0].strip().lower():
       logger.debug("Found oem in field: %s", components[0])
       if "xiaomi" in components[1].strip().lower():
@@ -911,102 +915,129 @@ def main():
   prefetched = False
   has_errors = False
   verification_failed_devices = set()
+  collection_error_devices = set()
   for target_device in connected_devices:
-    if target_device.unauthorized:
-      logger.error("Please authorize device with serial number %s for ADB via "
-                   "device GUI.", target_device.serial_number)
-      continue
-
-    # set up an adb_wrapper to be used throughout for this target device
-    adb_wrapper = AdbWrapper(target_device.serial_number, logger)
-
-    if is_hubble_installed(adb_wrapper, logger):
-      logger.debug("Removing previous Hubble installation...")
-      if not remove_previous_installation(adb_wrapper):
-        logger.error("Failed to remove previous Hubble installation.")
-        continue
-
-    if is_xiaomi_phone(adb_wrapper, logger):
-      logger.info("This is a Xiaomi phone.")
-      adb_push_hubble(adb_wrapper, args.hubble)
-      if not launch_xiaomi_file_explorer(adb_wrapper):
-        logger.error("Failed to launch Xiaomi file explorer")
-      while not is_hubble_installed(adb_wrapper, logger):
-        logger.warning("Please manually install Hubble by launching the "
-                       "\"Files Manager\" app (it may have been launched "
-                       "for you) and navigate to the \"Downloads\" folder.")
-        input("Press [ENTER] when you are done.")
-    else:
-      logger.info("This is not a Xiaomi phone. Regular workflow continues...")
-      if not install_hubble(adb_wrapper, args, logger):
-        logger.error("Error installing Hubble: %s", adb_wrapper.error_message)
-        continue
-    clear_logcat(adb_wrapper)
-
-    if not launch_hubble(adb_wrapper):
-      logger.error("Failed to launch Hubble: %s", adb_wrapper.error_message)
-      continue
-    results_source = wait_for_results(adb_wrapper, logger)
-
-    if not results_source:
-      logger.error("Failed to obtain results from Hubble execution.")
-      continue
-    extract_apks = (args.pull_all_apks is not None) or args.pull_preinstalled_apks_only
-    with tempfile.TemporaryDirectory() as device_tmp_dir:
-      results_dir = extract_results_and_apks(
-          adb_wrapper,
-          results_source,
-          args.output,
-          logger,
-          extract_apks,
-          pull_preinstalled_only=args.pull_preinstalled_apks_only,
-          tmp_dir=device_tmp_dir)
-
-    if not results_dir:
-      logger.error("Failed to extract results from target device (%s).",
-                   target_device.serial_number)
-      continue
-
-    extract_selinux_policies(adb_wrapper, results_dir, logger)
-    results[target_device.serial_number] = results_dir
-
-    if args.perform_inclusion_proof_check:
-      pkg_filename = (
-          "preinstalled_packages.txt"
-          if args.check_preinstalled_only
-          else "packages.txt"
-      )
-      packages_txt_path = os.path.join(results_dir, "results", pkg_filename)
-      if args.check_preinstalled_only and not os.path.isfile(packages_txt_path):
-        logger.error(
-            "preinstalled_packages.txt not found at %s (extracted results at %s). "
-            "--check_preinstalled_only requires Hubble >= 2.1.0.",
-            packages_txt_path, results_dir)
+    try:
+      if target_device.unauthorized:
+        logger.error("Please authorize device with serial number %s for ADB via "
+                     "device GUI.", target_device.serial_number)
         has_errors = True
-        verification_failed_devices.add(target_device.serial_number)
         continue
-      if (not args.no_prefetch and not prefetched and
-          os.path.isfile(packages_txt_path)):
-        prefetched = inclusion_proof_check.prefetch_log_entries(
+
+      # set up an adb_wrapper to be used throughout for this target device
+      adb_wrapper = AdbWrapper(target_device.serial_number, logger)
+
+      if is_hubble_installed(adb_wrapper, logger):
+        logger.debug("Removing previous Hubble installation...")
+        if not remove_previous_installation(adb_wrapper):
+          logger.error("Failed to remove previous Hubble installation.")
+          has_errors = True
+          continue
+
+      if is_xiaomi_phone(adb_wrapper, logger):
+        logger.info("This is a Xiaomi phone.")
+        adb_push_hubble(adb_wrapper, args.hubble)
+        if not launch_xiaomi_file_explorer(adb_wrapper):
+          logger.error("Failed to launch Xiaomi file explorer")
+        while not is_hubble_installed(adb_wrapper, logger):
+          logger.warning("Please manually install Hubble by launching the "
+                         "\"Files Manager\" app (it may have been launched "
+                         "for you) and navigate to the \"Downloads\" folder.")
+          input("Press [ENTER] when you are done.")
+      else:
+        logger.info("This is not a Xiaomi phone. Regular workflow continues...")
+        if not install_hubble(adb_wrapper, args, logger):
+          logger.error("Error installing Hubble: %s", adb_wrapper.error_message)
+          has_errors = True
+          continue
+      clear_logcat(adb_wrapper)
+
+      if not launch_hubble(adb_wrapper):
+        logger.error("Failed to launch Hubble: %s", adb_wrapper.error_message)
+        has_errors = True
+        continue
+      results_source = wait_for_results(adb_wrapper, logger)
+
+      if not results_source:
+        logger.error("Failed to obtain results from Hubble execution.")
+        has_errors = True
+        continue
+      extract_apks = (args.pull_all_apks is not None) or args.pull_preinstalled_apks_only
+      with tempfile.TemporaryDirectory() as device_tmp_dir:
+        results_dir = extract_results_and_apks(
+            adb_wrapper,
+            results_source,
+            args.output,
+            logger,
+            extract_apks,
+            pull_preinstalled_only=args.pull_preinstalled_apks_only,
+            tmp_dir=device_tmp_dir)
+
+      if not results_dir:
+        logger.error("Failed to extract results from target device (%s).",
+                     target_device.serial_number)
+        has_errors = True
+        continue
+
+      extract_selinux_policies(adb_wrapper, results_dir, logger)
+      results[target_device.serial_number] = results_dir
+
+      if args.perform_inclusion_proof_check:
+        pkg_filename = (
+            "preinstalled_packages.txt"
+            if args.check_preinstalled_only
+            else "packages.txt"
+        )
+        packages_txt_path = os.path.join(results_dir, "results", pkg_filename)
+        if args.check_preinstalled_only and not os.path.isfile(packages_txt_path):
+          logger.error(
+              "preinstalled_packages.txt not found at %s (extracted results at %s). "
+              "--check_preinstalled_only requires Hubble >= 2.1.0.",
+              packages_txt_path, results_dir)
+          has_errors = True
+          verification_failed_devices.add(target_device.serial_number)
+          continue
+        if (not args.no_prefetch and not prefetched and
+            os.path.isfile(packages_txt_path)):
+          prefetched = inclusion_proof_check.prefetch_log_entries(
+              args.verifier_path,
+              logger,
+              cache_dir=args.cache_dir,
+              concurrency=args.cache_prefetch_concurrency,
+              timeout=args.cache_prefetch_timeout)
+        if not inclusion_proof_check.perform_inclusion_proof_check(
             args.verifier_path,
+            packages_txt_path,
             logger,
             cache_dir=args.cache_dir,
             concurrency=args.cache_prefetch_concurrency,
-            timeout=args.cache_prefetch_timeout)
-      if not inclusion_proof_check.perform_inclusion_proof_check(
-          args.verifier_path,
-          packages_txt_path,
-          logger,
-          cache_dir=args.cache_dir,
-          concurrency=args.cache_prefetch_concurrency,
-          timeout=args.cache_prefetch_timeout,
-          prefetch=False,
-          preinstalled_only=args.check_preinstalled_only):
-        has_errors = True
-        verification_failed_devices.add(target_device.serial_number)
+            timeout=args.cache_prefetch_timeout,
+            prefetch=False,
+            preinstalled_only=args.check_preinstalled_only):
+          has_errors = True
+          verification_failed_devices.add(target_device.serial_number)
+    except Exception as e:
+      logger.exception("Unexpected error while processing device %s: %s",
+                       target_device.serial_number, e)
+      has_errors = True
+      if target_device.serial_number in results:
+        collection_error_devices.add(target_device.serial_number)
 
-  for device in results:
-    if device in verification_failed_devices:
+  for target_device in connected_devices:
+    device = target_device.serial_number
+    if device not in results:
+      logger.error(
+          "FAILED: Hubble data collection failed on connected device %s "
+          "(exiting 1).",
+          device)
+      continue
+    if device in collection_error_devices:
+      logger.warning(
+          "PARTIAL SUCCESS: Hubble data collection succeeded on connected "
+          "device %s, but an unexpected error occurred during post-collection "
+          "processing (exiting 1).",
+          device)
+    elif device in verification_failed_devices:
       logger.warning(
           "PARTIAL SUCCESS: Hubble data collection succeeded on connected "
           "device %s, but inclusion proof verification failed (exiting 1).",
