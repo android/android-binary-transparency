@@ -594,8 +594,9 @@ func FetchAllTesseraEntries(ctx context.Context, logBaseURL string, treeSize int
 	return nil
 }
 
-// TesseraFindPayloadIndex searches the Tessera entry tiles for targetPayload
-// and returns its 0-based sequence index in the log.
+// TesseraFindPayloadIndex searches the Tessera entry tiles in reverse order
+// (newest to oldest) for targetPayload and returns its 0-based sequence index
+// in the log. It returns the highest index if the payload appears more than once.
 // Returns (index, true, nil) if found, (-1, false, nil) if not found.
 func TesseraFindPayloadIndex(logBaseURL string, treeSize int64, targetPayload []byte) (int64, bool, error) {
 	if treeSize <= 0 {
@@ -605,9 +606,9 @@ func TesseraFindPayloadIndex(logBaseURL string, treeSize int64, targetPayload []
 	numTiles := (treeSize + 255) / 256
 	target := bytes.TrimSpace(targetPayload)
 
-	// TODO: Consider supporting reverse scanning (from last tile to first) as recent packages tend to be
-	//       more commonly verified.
-	for tileN := int64(0); tileN < numTiles; tileN++ {
+	// Search in reverse (latest to oldest) to find recent packages with typically
+	// fewer HTTP requests on cold caches.
+	for tileN := numTiles - 1; tileN >= 0; tileN-- {
 		w := 256
 		if (tileN+1)*256 > treeSize {
 			w = int(treeSize - tileN*256)
@@ -623,8 +624,8 @@ func TesseraFindPayloadIndex(logBaseURL string, treeSize int64, targetPayload []
 			return -1, false, fmt.Errorf("failed to parse entry tile %d: %w", tileN, err)
 		}
 
-		for idx, entry := range entries {
-			if bytes.Equal(bytes.TrimSpace(entry), target) {
+		for idx := len(entries) - 1; idx >= 0; idx-- {
+			if bytes.Equal(bytes.TrimSpace(entries[idx]), target) {
 				return tileN*256 + int64(idx), true, nil
 			}
 		}
