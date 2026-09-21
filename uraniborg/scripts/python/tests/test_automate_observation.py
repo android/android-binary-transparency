@@ -340,7 +340,7 @@ def test_extract_apks_from_preinstalled_packages(tmp_path: Path):
   """Verifies extract_apks_from_device uses explicit preinstalled_only intent."""
   preinstall_file = tmp_path / "preinstalled_packages.txt"
   preinstall_file.write_text(json.dumps({
-      "version": "2.1.0",
+      "version": "2.2.0",
       "totalPreinstalledPackages": 1,
       "preinstalledPackages": [{
           "name": "com.android.settings",
@@ -366,7 +366,7 @@ def test_extract_apks_from_preinstalled_packages(tmp_path: Path):
   # Verify an empty "packages": [] does NOT fall through to "preinstalledPackages"
   empty_packages_file = tmp_path / "packages.txt"
   empty_packages_file.write_text(json.dumps({
-      "version": "2.1.0",
+      "version": "2.2.0",
       "packages": [],
       "preinstalledPackages": [{
           "name": "com.android.settings",
@@ -903,7 +903,7 @@ def test_extract_apks_from_device_retry_via_tmp_and_failure_cleanup(
   packages_file = tmp_path / "packages.txt"
   packages_file.write_text(
       json.dumps({
-          "version": "2.1.0",
+          "version": "2.2.0",
           "packages": [
               {
                   "name": "com.app.direct_ok",
@@ -1035,7 +1035,7 @@ def test_extract_apks_from_device_input_validation_edge_cases(tmp_path: Path):
 
   # 6. JSON with non-list expected key ("packages": None)
   bad_json_file = tmp_path / "bad_packages.txt"
-  bad_json_file.write_text(json.dumps({"version": "2.1.0", "packages": None}))
+  bad_json_file.write_text(json.dumps({"version": "2.2.0", "packages": None}))
   assert (
       automate_observation.extract_apks_from_device(
           mock_adb, str(bad_json_file), apks_dir, logger
@@ -1048,7 +1048,7 @@ def test_extract_apks_from_device_input_validation_edge_cases(tmp_path: Path):
   partial_entries_file = tmp_path / "partial_entries.txt"
   partial_entries_file.write_text(
       json.dumps({
-          "version": "2.1.0",
+          "version": "2.2.0",
           "packages": [
               {"name": "com.missing.location"},
               {"installLocation": "/data/app/missing_name.apk"},
@@ -1092,11 +1092,11 @@ def test_classify_dir_sequential_numbering_and_failed_extraction_file(
   """Verifies 000/001 sequential numbering, apks/ creation, and failed_extraction.txt output."""
   fingerprint = "google/lynx/lynx:17/CP2A.260705.006/123456:user/release-keys"
   build_json_content = json.dumps({
-      "version": "2.1.0",
+      "version": "2.2.0",
       "buildInfo": [{"fingerprint": fingerprint}],
   })
   packages_json_content = json.dumps({
-      "version": "2.1.0",
+      "version": "2.2.0",
       "packages": [{
           "name": "com.example.unpullable",
           "installLocation": "/system/priv-app/Unpullable/Unpullable.apk",
@@ -1177,11 +1177,11 @@ def test_classify_dir_adb_backup_fallback(tmp_path: Path):
   """Verifies adb backup decompression, tar extraction, path-traversal rejection, and source_dir move."""
   fingerprint = "google/lynx/lynx:17/CP2A.260705.006/999:user/release-keys"
   build_bytes = json.dumps({
-      "version": "2.1.0",
+      "version": "2.2.0",
       "buildInfo": [{"fingerprint": fingerprint}],
   }).encode("utf-8")
   packages_bytes = json.dumps({
-      "version": "2.1.0",
+      "version": "2.2.0",
       "packages": [{
           "name": "com.example.backup_app",
           "installLocation": "/data/app/backup_app/base.apk",

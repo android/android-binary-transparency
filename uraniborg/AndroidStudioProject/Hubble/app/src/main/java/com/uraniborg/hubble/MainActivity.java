@@ -49,7 +49,7 @@ public class MainActivity extends AppCompatActivity {
   // semantically tie the notion of app version to versionName, which we will update for every
   // major and minor release. Unfortunately, for now, we have to independently and separately
   // update these values everytime we do any revisions because BuildConfig is phased out.
-  private final String VERSION = "2.1.0";
+  private final String VERSION = "2.2.0";
 
   // We're changing to TreeMap so that package names are sorted. This would ease output comparison.
   private TreeMap<String, PackageMetadata> mAllPackages;
@@ -128,6 +128,106 @@ public class MainActivity extends AppCompatActivity {
     Log.d(tag, String.format("There are %d packages (including APEX)", mAllPackages.size()));
   }
 
+  // The Android framework ("platform") package. Its signing identity is what defines a
+  // "platform-signed" package and gates access to the system shared UIDs.
+  static final String PLATFORM_PACKAGE_NAME = "android";
+
+  /**
+   * Returns {@link PackageManager#checkSignatures(String, String)}'s verdict comparing
+   * {@code pkgName} against the platform ({@code android}) package.
+   *
+   * <p>Recorded verbatim as an observation. Per AOSP
+   * {@code ComputerEngine#checkSignaturesInternal} and
+   * {@code PackageManagerServiceUtils#compareSignatures}, the algorithm is:
+   *
+   * <ol>
+   *   <li>Compare the two packages' <em>current</em> signer sets for exact set equality.</li>
+   *   <li>If that fails and either side has a signing lineage, retry using only the
+   *       <em>oldest</em> ancestor of each ({@code getPastSigningCertificates()[0]}) - an
+   *       explicit backwards-compatibility path for callers predating key rotation.</li>
+   * </ol>
+   *
+   * <p>IMPORTANT: this is <em>not</em> a capability-aware trust decision, and it is not a
+   * sound oracle for "is this platform-signed?". It never consults the per-ancestor
+   * {@code SigningDetails.CertCapabilities} flags ({@code PERMISSION},
+   * {@code SHARED_USER_ID}); those are evaluated elsewhere in the framework (shared-UID join
+   * logic and the permission subsystem) and are not reachable from any public API. Two known
+   * divergences follow directly from the algorithm above:
+   *
+   * <ul>
+   *   <li>A package that has rotated <em>away</em> from the platform key still reports
+   *       {@code MATCH}, because the oldest-ancestor retry compares the retired platform
+   *       certificate.</li>
+   *   <li>A package co-signed by the platform key <em>plus</em> another key reports
+   *       {@code NO_MATCH}, because step 1 requires exact set equality.</li>
+   * </ul>
+   *
+   * <p>Consumers should therefore treat this as descriptive metadata (what
+   * {@code PackageManager} itself would report to an app), not as the basis for platform
+   * trust. See {@code HubbleParser.is_platform_signed()}.
+   *
+   * @param pkgName the package to compare against the platform package.
+   * @return one of {@code MATCH}, {@code NO_MATCH}, {@code NEITHER_SIGNED},
+   *     {@code FIRST_NOT_SIGNED}, {@code SECOND_NOT_SIGNED}, {@code UNKNOWN_PACKAGE}, or
+   *     {@code UNKNOWN} if the query itself failed.
+   */
+  @NotNull
+  private String getPlatformSignatureMatch(@NotNull String pkgName) {
+    final String tag = TAG + "-CERT";
+    try {
+      int result = mPackageManager.checkSignatures(pkgName, PLATFORM_PACKAGE_NAME);
+      switch (result) {
+        case PackageManager.SIGNATURE_MATCH:
+          return "MATCH";
+        case PackageManager.SIGNATURE_NO_MATCH:
+          return "NO_MATCH";
+        case PackageManager.SIGNATURE_NEITHER_SIGNED:
+          return "NEITHER_SIGNED";
+        case PackageManager.SIGNATURE_FIRST_NOT_SIGNED:
+          return "FIRST_NOT_SIGNED";
+        case PackageManager.SIGNATURE_SECOND_NOT_SIGNED:
+          return "SECOND_NOT_SIGNED";
+        case PackageManager.SIGNATURE_UNKNOWN_PACKAGE:
+          // Expected for entries (e.g. some APEXes) that PackageManager does not track as a
+          // signature-comparable package. Consumers should fall back to digest comparison.
+          return "UNKNOWN_PACKAGE";
+        default:
+          Log.e(tag, String.format("Unexpected checkSignatures result %d for package: %s", result,
+              pkgName));
+          return "UNKNOWN";
+      }
+    } catch (RuntimeException e) {
+      Log.e(tag, String.format("Failed to checkSignatures against platform for package %s: %s",
+          pkgName, e.getMessage()));
+      return "UNKNOWN";
+    }
+  }
+
+  @NotNull
+  private JSONArray extractAndRegisterCertificates(@NotNull String pkgName,
+                                                   @Nullable Signature[] signatures) {
+    final String tag = TAG + "-CERT";
+    JSONArray digests = new JSONArray();
+    if (signatures == null) {
+      return digests;
+    }
+    for (Signature signature : signatures) {
+      if (signature == null) {
+        continue;
+      }
+      String encodedSignatureDigest = Utilities.computeSHA256DigestOfCertificate(signature);
+      if (encodedSignatureDigest == null) {
+        Log.e(tag, String.format("Failed to compute hash for cert of package: %s", pkgName));
+        continue;
+      }
+      if (!mAllCertificates.containsKey(encodedSignatureDigest)) {
+        mAllCertificates.put(encodedSignatureDigest, signature.toByteArray());
+      }
+      digests.put(encodedSignatureDigest);
+    }
+    return digests;
+  }
+
   @SuppressWarnings("deprecation")
   private void getAllCertificates() {
     final String tag = TAG + "-CERT";
@@ -138,35 +238,82 @@ public class MainActivity extends AppCompatActivity {
         continue;
       }
       PackageInfo pkgInfo = pkgMetadata.ref;
-      Signature[] signatures;
-      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
-        signatures = pkgInfo.signatures;
-      } else {
-        SigningInfo signingInfo = pkgInfo.signingInfo;
-        if (signingInfo.hasMultipleSigners()) {
-          signatures = signingInfo.getApkContentsSigners();
-        } else {
-          signatures = signingInfo.getSigningCertificateHistory();
-        }
-      }
-      if (signatures == null) {
-        Log.e(tag, String.format("Failed to grab signature for package: %s", pkgName));
-        continue;
-      }
+      JSONObject signingInfoJson = new JSONObject();
+      // Recorded verbatim as an observation; see getPlatformSignatureMatch().
+      String platformSignatureMatch = getPlatformSignatureMatch(pkgName);
 
-      JSONArray signaturesJSONArray = new JSONArray();
-      for (Signature signature : signatures) {
-        String encodedSignatureDigest = Utilities.computeSHA256DigestOfCertificate(signature);
-        if (encodedSignatureDigest == null) {
-          Log.e(tag, String.format("Failed to compute hash for cert of package: %s", pkgName));
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+        Signature[] signatures = pkgInfo.signatures;
+        if (signatures == null) {
+          Log.e(tag, String.format("Failed to grab signature for package: %s", pkgName));
           continue;
         }
-        if (!mAllCertificates.containsKey(encodedSignatureDigest)) {
-          mAllCertificates.put(encodedSignatureDigest, signature.toByteArray());
+        // Count the declared signers BEFORE computing digests: a single
+        // computeSHA256DigestOfCertificate() failure drops an entry, and must not silently
+        // demote a co-signed APK to a single-signer one.
+        int declaredSignerCount = 0;
+        for (Signature signature : signatures) {
+          if (signature != null) {
+            declaredSignerCount++;
+          }
         }
-        signaturesJSONArray.put(encodedSignatureDigest);
+        JSONArray activeSigners = extractAndRegisterCertificates(pkgName, signatures);
+        pkgMetadata.certIds = activeSigners;
+        try {
+          signingInfoJson.put("hasMultipleSigners", declaredSignerCount > 1);
+          // NOTE: pre-P PackageManager exposes no v3 lineage API at all, so rotation is
+          // UNOBSERVABLE here rather than known to be absent. Emit null (not false) and no
+          // lineage, so consumers classify these as UNKNOWN instead of asserting "never
+          // rotated". See docs/hubble_results.md.
+          signingInfoJson.put("hasPastSigningCertificates", JSONObject.NULL);
+          signingInfoJson.put("apkContentsSigners", activeSigners);
+          signingInfoJson.put("signingCertificateLineage", new JSONArray());
+          signingInfoJson.put("platformSignatureMatch", platformSignatureMatch);
+          pkgMetadata.signingInfo = signingInfoJson;
+        } catch (JSONException e) {
+          Log.e(tag, String.format("Failed to build signingInfo JSON for package %s: %s",
+              pkgName, e.getMessage()));
+        }
+      } else {
+        SigningInfo signingInfo = pkgInfo.signingInfo;
+        if (signingInfo == null) {
+          Log.e(tag, String.format("Failed to grab signingInfo for package: %s", pkgName));
+          continue;
+        }
+        boolean hasMultipleSigners = signingInfo.hasMultipleSigners();
+        boolean hasPastSigningCertificates = signingInfo.hasPastSigningCertificates();
+        Signature[] activeSignatures = signingInfo.getApkContentsSigners();
+        Signature[] lineageSignatures =
+            hasMultipleSigners ? null : signingInfo.getSigningCertificateHistory();
+
+        if (activeSignatures == null && lineageSignatures == null) {
+          Log.e(tag, String.format("Failed to grab signature for package: %s", pkgName));
+          continue;
+        }
+
+        JSONArray apkContentsSigners = extractAndRegisterCertificates(pkgName, activeSignatures);
+        JSONArray signingCertificateLineage =
+            extractAndRegisterCertificates(pkgName, lineageSignatures);
+
+        if (hasMultipleSigners) {
+          pkgMetadata.certIds = apkContentsSigners;
+        } else {
+          pkgMetadata.certIds = (signingCertificateLineage.length() > 0)
+              ? signingCertificateLineage : apkContentsSigners;
+        }
+
+        try {
+          signingInfoJson.put("hasMultipleSigners", hasMultipleSigners);
+          signingInfoJson.put("hasPastSigningCertificates", hasPastSigningCertificates);
+          signingInfoJson.put("apkContentsSigners", apkContentsSigners);
+          signingInfoJson.put("signingCertificateLineage", signingCertificateLineage);
+          signingInfoJson.put("platformSignatureMatch", platformSignatureMatch);
+          pkgMetadata.signingInfo = signingInfoJson;
+        } catch (JSONException e) {
+          Log.e(tag, String.format("Failed to build signingInfo JSON for package %s: %s",
+              pkgName, e.getMessage()));
+        }
       }
-      pkgMetadata.certIds = signaturesJSONArray;
     }
   }
 

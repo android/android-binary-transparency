@@ -359,7 +359,7 @@ def test_perform_inclusion_proof_check_with_preinstalled_packages_and_metadata(
 
   preinstalled_file = tmp_path / "preinstalled_packages.txt"
   preinstalled_file.write_text(json.dumps({
-      "version": "2.1.0",
+      "version": "2.2.0",
       "totalPreinstalledPackages": 2,
       "preinstalledPackages": [
           {

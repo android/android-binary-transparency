@@ -16,6 +16,13 @@ errors that leads to truncation of file, for example.
 > `preinstalled_packages.txt`, `isUpdatedSystemApp`, and `isApex`). Major
 > version bumps break compatibility; output from Hubble `1.0.0` (or any version
 > `< 2.1.0`) and higher major versions (`>= 3.0.0`) is **not supported**.
+>
+> Minor versions within `2.x` are **additive** and never raise the supported
+> floor, so previously collected corpora remain readable and comparable over
+> time. Schema `2.2.0` adds the structured `signingInfo` object (lineage vs.
+> co-signer metadata) while leaving `certIds` unchanged; when reading `2.1.0`
+> output, signing-mode helpers report `UNKNOWN` rather than rejecting the
+> observation.
 
 <!-- TODO: Remove legacy categorization / baseline helpers in scripts/python/hubble_parser.py and legacy scoring metrics PDF in docs/. -->
 
@@ -94,7 +101,10 @@ This file enumerates all installed packages on the system at the time of
 observation.
 
 - activities: A list of `activity`s that the package contains (can be empty).
-- certIds: SHA256 digest of certificate(s) used to sign this package.
+- certIds: SHA256 digest(s) of certificate(s) associated with this package (for
+  co-signed packages, the active co-signers; for single-signer packages, the
+  signing certificate lineage or single signer). Use `signingInfo` below to
+  disambiguate active signers from key rotation lineage.
 - description: The description of the application (if available).
 - firstInstallTime: The recorded time (in ms) of the first install time of this
 package.
@@ -137,6 +147,12 @@ package at the time of observation.
 - sharedUserId: a string representing the [shared user ID](https://developer.android.com/reference/android/content/pm/PackageInfo.html#sharedUserId) of this package.
 - sharedUserLabel: an integer representing the [shared user ID label](https://developer.android.com/reference/android/content/pm/PackageInfo.html#sharedUserLabel) of this
 package.
+- signingInfo: *(added in schema `2.2.0`; absent in `2.1.0` output)* A nested JSON object capturing structured [`SigningInfo`](https://developer.android.com/reference/android/content/pm/SigningInfo) metadata so that APK Signature Scheme v3 key rotation lineages are cleanly distinguished from multi-signer (co-signed) APKs:
+  - `hasMultipleSigners`: A boolean indicating whether the package is simultaneously co-signed by multiple active signers (`SigningInfo.hasMultipleSigners()`). On API < 28 this is derived from the length of the deprecated `PackageInfo.signatures` array, counted *before* digest computation so that a failed digest cannot silently demote a co-signed APK.
+  - `hasPastSigningCertificates`: A boolean indicating whether the package has rotated its signing key and includes past ancestor signing certificates in its v3 lineage (`SigningInfo.hasPastSigningCertificates()`). **Tri-state:** on API < 28 the platform exposes no v3 lineage API at all, so this is `null` rather than `false` — rotation is *unobservable* there, not known to be absent. Consumers must not read `null` as "never rotated"; `HubbleParser.classify_package_signing()` reports `UNKNOWN` for it.
+  - `apkContentsSigners`: A list of SHA256 certificate digests for the **currently active** signer(s) (`SigningInfo.getApkContentsSigners()`). For single-signer packages (with or without key rotation), this contains exactly 1 element (the current active signer). For co-signed packages (`hasMultipleSigners == true`), this contains all active co-signers.
+  - `signingCertificateLineage`: A list of SHA256 certificate digests representing the ordered signing certificate lineage (`SigningInfo.getSigningCertificateHistory()`) from the **oldest (original) ancestor signing certificate at index `0`** to the **current active signing certificate at index `-1`**. When `hasMultipleSigners == true`, this is an empty array `[]` (as Android does not support v3 key rotation for multi-signer APKs). It is also `[]` on API < 28, where no lineage is observable — Hubble deliberately does not fabricate one from the active signers.
+  - `platformSignatureMatch`: The verdict from [`PackageManager.checkSignatures(pkgName, "android")`](https://developer.android.com/reference/android/content/pm/PackageManager#checkSignatures(java.lang.String,%20java.lang.String)) — one of `MATCH`, `NO_MATCH`, `NEITHER_SIGNED`, `FIRST_NOT_SIGNED`, `SECOND_NOT_SIGNED`, `UNKNOWN_PACKAGE`, or `UNKNOWN`. Recorded verbatim as an **observation of what `PackageManager` reports to apps**. Per AOSP `ComputerEngine.checkSignaturesInternal()`, it (1) compares the two packages' **current** signer sets for exact set equality, then (2) on failure, if either side has a lineage, retries using only the **oldest** ancestor of each — an explicit backwards-compatibility path for callers predating key rotation. It does **not** consult `CertCapabilities`. See the caution below for why this is *not* used to determine platform signing. `UNKNOWN_PACKAGE` is expected for entries (e.g. `com.android.privatespace`) that `PackageManager` does not resolve as a signature-comparable package.
 - splitNames: any names of installed [split APKs](https://developer.android.com/reference/android/content/pm/PackageInfo#splitNames)
 of this package.
 - usesCleartextTraffic: a boolean [flag](https://developer.android.com/reference/android/content/pm/ApplicationInfo.html#FLAG_USES_CLEARTEXT_TRAFFIC)indicating whether or not this
@@ -255,3 +271,83 @@ inspection of `installLocation` as described below:
 > | `/data/apex/active/*@*.decompressed.apex`, `/data/apex/decompressed/*@*.decompressed.apex` | **Factory Pre-installed** (compressed CAPEX decompressed at boot, not an update) |
 > | `/data/apex/active/*@*.apex` (ending in `.apex`, **not** `.decompressed.apex`) | **Updated Mainline Module** (post-setup OTA update via Play / Mainline; hash reflects updated binary) |
 > | Any other path (or `isPreinstalled == false`) | **Unknown (`UNKNOWN`)** (unrecognized OEM APEX layout; emits a warning instead of assuming updated) |
+
+### Determining Package Signing Certificate Lineage vs. Co-Signing
+In Android (API 28+ / APK Signature Scheme v3), an APK with multiple associated
+certificates in `certIds` can represent two completely different cryptographic
+configurations:
+
+1. **Key Rotation Lineage (`KEY_ROTATION_LINEAGE`):** The package has a single
+   active signer, but has rotated its signing key from one or more historical
+   ancestor certificates (`signingInfo.hasMultipleSigners == false`,
+   `signingInfo.hasPastSigningCertificates == true`).
+2. **Co-Signed by Multiple Active Signers (`MULTIPLE_SIGNERS`):** The package
+   is simultaneously co-signed by two or more active certificates
+   (`signingInfo.hasMultipleSigners == true`,
+   `signingInfo.hasPastSigningCertificates == false`). Android does not support
+   v3 key rotation for multi-signer APKs.
+
+Use the nested `signingInfo` object (or `HubbleParser.classify_package_signing()`,
+`get_active_signers()`, `get_signing_lineage()`, and
+`get_past_signing_certificates()`) to distinguish these cases:
+
+| Signing Mode (`HubbleParser`) | `signingInfo.hasMultipleSigners` | `signingInfo.hasPastSigningCertificates` | `signingInfo.apkContentsSigners` | `signingInfo.signingCertificateLineage` | Meaning |
+| :--- | :---: | :---: | :--- | :--- | :--- |
+| **`SINGLE_SIGNER`** | `false` | `false` | `[cert_current]` (len `1`) | `[cert_current]` (len `1`) | Signed by a single certificate with no key rotation history |
+| **`KEY_ROTATION_LINEAGE`** | `false` | `true` | `[cert_current]` (len `1`) | `[cert_oldest, ..., cert_current]` (len `>= 2`) | Single active signer (`cert_current`) with ordered v3 key rotation history from `cert_oldest` |
+| **`MULTIPLE_SIGNERS`** | `true` | `false` or `null` | `[cert_1, cert_2, ...]` (len `>= 2`) | `[]` (empty) | Simultaneously co-signed by all listed certificates in `apkContentsSigners`. Reported affirmatively even on API < 28, where the signer count is observable. |
+| **`UNKNOWN`** (legacy schema) | — | — | — | — | No `signingInfo` object at all (legacy schema `2.1.0` output), or malformed metadata. The flat `certIds` list cannot distinguish a lineage from co-signers, so the mode is never guessed. Use `HubbleParser.has_structured_signing_info()` to detect this. |
+| **`UNKNOWN`** (API < 28) | `false` | `null` | `[cert_current]` (len `1`) | `[]` (empty) | Collected on a pre-P device, where PackageManager exposes no v3 lineage API. The package may or may not have rotated its key; Hubble reports `null` instead of asserting `SINGLE_SIGNER`. |
+
+> [!IMPORTANT]
+> **Lineage Ordering (`certIds[0]` vs. `apkContentsSigners[0]`):**
+> When `signingInfo.hasPastSigningCertificates == true`, Android's
+> `getSigningCertificateHistory()` orders certificates from the **oldest
+> (retired) ancestor at index `0`** to the **current active signer at the last
+> index (`[-1]`)**. Always read `signingInfo.apkContentsSigners` (or call
+> `HubbleParser.get_active_signers(pkg)`) to obtain the currently active
+> signing certificate(s) rather than indexing `certIds[0]`.
+
+> [!CAUTION]
+> **Platform-Package Matching is Directional.**
+> Platform-package and shared-UID matching in `HubbleParser`
+> (`get_platform_packages()`, `print_platform_packages()`, and
+> `get_shared_uid_packages()`) all funnel through
+> `HubbleParser.is_platform_signed(pkg)`, which compares the package's
+> **active** signer(s) against the platform's **full** lineage
+> (`get_platform_signatures()`).
+>
+> **Never intersect two full certificate sets.** A package that has rotated
+> *away* from the platform key still carries that key in its own lineage, so a
+> symmetric intersection would keep treating it as platform-signed forever. Only
+> the platform side may use the full lineage (as the trust anchor); the candidate
+> side must use active signers only.
+>
+> **`platformSignatureMatch` is deliberately NOT used for this decision.**
+> `PackageManager.checkSignatures()` is a legacy, pre-rotation-compatible API,
+> not a capability-aware trust check. It compares current signer sets for exact
+> equality, then retries with only the oldest ancestor of each lineage, and never
+> calls `SigningDetails.checkCapability()`. That makes it unsound in both
+> directions here:
+>
+> | Scenario | `checkSignatures` | `is_platform_signed()` | Why they differ |
+> | :--- | :---: | :---: | :--- |
+> | Package rotated **away** from the platform key | `MATCH` | `false` | Oldest-ancestor retry compares the *retired* platform cert |
+> | Package co-signed by platform key **+** another key | `NO_MATCH` | `true` | Exact set equality fails, but the platform key is an active signer |
+>
+> Use `HubbleParser.get_platform_signature_match(pkg)` when you specifically want
+> the `PackageManager` verdict (e.g. to reason about legacy callers of that API).
+
+> [!WARNING]
+> **Signing-lineage capability flags are not observable at all.**
+> When a key is rotated, each ancestor node carries
+> `SigningDetails.CertCapabilities` flags (`PERMISSION`, `SHARED_USER_ID`,
+> `INSTALLED_DATA`, `ROLLBACK`, `AUTH`) which the rotation may **revoke**. The
+> framework honours these in its shared-UID join logic and permission subsystem,
+> but they are not reachable from any public API — not via `SigningInfo`, and not
+> via `checkSignatures()`. Hubble therefore cannot record them.
+>
+> Consequently a retired platform certificate whose capabilities were revoked is
+> indistinguishable from one that retains them, and `is_platform_signed()` may
+> **over-approximate** platform trust for un-rotated system packages still signed
+> with a retired platform certificate.
