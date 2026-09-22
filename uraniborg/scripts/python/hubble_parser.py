@@ -22,6 +22,12 @@ observations and expose them as method calls to its consumers.
 IMPORTANT: Backwards compatibility with Hubble 1.0.0 (or any version earlier
 than 2.1.0) is intentionally NOT supported. Major version bumps break backwards
 compatibility by design.
+
+Within the supported 2.x range, minor versions are additive and are read on a
+best-effort basis. In particular, the `signingInfo` object introduced in 2.2.0
+is absent from 2.1.0 output; helpers that depend on it degrade gracefully (see
+`has_structured_signing_info`) rather than rejecting the observation, so that
+previously collected 2.1.0 corpora remain readable and comparable over time.
 """
 
 import base64
@@ -40,10 +46,21 @@ class HubbleParser:
 
   NOTE: Requires Hubble output schema 2.x (>= 2.1.0). Output from Hubble 1.0.0
   (or any version < 2.1.0) and higher major versions (>= 3.0.0) is NOT supported.
+  Schema 2.2.0 adds the `signingInfo` object; 2.1.0 output remains supported and
+  is handled via documented legacy fallbacks.
   """
   # Encodes the supported major version and minimum minor version (schema 2.x, >= 2.1.0).
   # Compatibility with < 2.1.0 (including 1.0.0) and >= 3.0.0 is NOT supported.
+  #
+  # NOTE: Deliberately NOT bumped to 2.2.0. The 2.2.0 `signingInfo` object is purely
+  # additive and leaves `certIds` byte-for-byte unchanged, so raising this floor would
+  # invalidate every previously collected 2.1.0 observation for no correctness benefit.
+  # Only raise this for a genuinely breaking schema change.
   EXPECTED_VERSION = "2.1.0"
+
+  # The minor version that introduced the structured `signingInfo` object. Used only to
+  # document/describe capability, never to reject an observation.
+  SIGNING_INFO_MIN_VERSION = "2.2.0"
 
   # These are core files and their corresponding filenames that Hubble outputs,
   # which may expand in the future.
@@ -64,6 +81,14 @@ class HubbleParser:
   PACKAGE_STATE_UPDATED_MAINLINE_MODULE = "UPDATED_MAINLINE_MODULE"
   PACKAGE_STATE_USER_INSTALLED = "USER_INSTALLED"
   PACKAGE_STATE_UNKNOWN = "UNKNOWN"
+
+  SIGNING_MODE_SINGLE_SIGNER = "SINGLE_SIGNER"
+  SIGNING_MODE_KEY_ROTATION_LINEAGE = "KEY_ROTATION_LINEAGE"
+  SIGNING_MODE_MULTIPLE_SIGNERS = "MULTIPLE_SIGNERS"
+  SIGNING_MODE_UNKNOWN = "UNKNOWN"
+
+  # The Android framework package, whose signing identity defines "platform-signed".
+  PLATFORM_PACKAGE_NAME = "android"
 
   # TODO: Remove SYSTEM_SHARED_UID_SET along with legacy baseline/risk-scoring
   # categorization helpers.
@@ -94,6 +119,199 @@ class HubbleParser:
       return True
     except (ValueError, AttributeError):
       return False
+
+  @staticmethod
+  def has_structured_signing_info(package):
+    """Returns True if the package carries the structured `signingInfo` object.
+
+    The `signingInfo` object was introduced in Hubble schema 2.2.0. Observations
+    collected with 2.1.0 do not have it, and for those the flat `certIds` list is
+    inherently ambiguous: it holds either a key rotation lineage OR a set of
+    active co-signers, with no way to tell which. Callers that need to reason
+    about signing semantics should check this first and treat a False result as
+    "unknown" rather than assuming a single signer.
+
+    Args:
+      package: A dict representing a package entry from packages.txt.
+
+    Returns:
+      True if structured signing metadata is present, False for legacy output.
+    """
+    return (isinstance(package, dict) and
+            isinstance(package.get("signingInfo"), dict))
+
+  @staticmethod
+  def get_active_signers(package):
+    """Returns the currently active signing certificate digest(s) for a package.
+
+    For single-signer packages (with or without a key rotation lineage), this
+    returns a 1-element list containing the current active signer. For co-signed
+    packages (hasMultipleSigners=True), this returns all active co-signers.
+
+    LEGACY (schema < 2.2.0): when `signingInfo` is absent, this falls back to the
+    flat `certIds` list. That list is ambiguous - for a rotated package it is the
+    full lineage (oldest first), not just the active signer - so the result is an
+    over-approximation. Use `has_structured_signing_info()` to detect this case.
+
+    Args:
+      package: A dict representing a package entry from packages.txt.
+
+    Returns:
+      A list of SHA-256 hex digest strings for the active signer(s).
+    """
+    if not isinstance(package, dict):
+      return []
+    signing_info = package.get("signingInfo")
+    if isinstance(signing_info, dict):
+      active = signing_info.get("apkContentsSigners")
+      if isinstance(active, list) and active:
+        return list(active)
+      # apkContentsSigners should always be populated in 2.2.0+, but if every
+      # digest failed to compute on device, recover the active signer from the
+      # tail of the lineage (Android orders it oldest -> current).
+      if not signing_info.get("hasMultipleSigners", False):
+        lineage = signing_info.get("signingCertificateLineage")
+        if isinstance(lineage, list) and lineage:
+          return [lineage[-1]]
+      return []
+    cert_ids = package.get("certIds")
+    if isinstance(cert_ids, list):
+      return list(cert_ids)
+    return []
+
+  @staticmethod
+  def get_signing_lineage(package):
+    """Returns the ordered signing certificate lineage for a package.
+
+    When a package is not co-signed (hasMultipleSigners=False), returns the
+    certificate digests ordered from oldest ancestor at index 0 to the current
+    active signer at index -1. When a package is co-signed by multiple signers
+    (hasMultipleSigners=True), returns an empty list because multi-signer APKs
+    do not have a signing certificate rotation lineage.
+
+    LEGACY (schema < 2.2.0): returns [] because pre-2.2.0 output cannot express a
+    lineage unambiguously. This is deliberately NOT backfilled from `certIds`, so
+    that "no lineage" is never confused with "lineage unknown".
+
+    API < 28: also returns [], because the platform exposes no v3 lineage API.
+    Hubble deliberately does not fabricate one from the active signers; use
+    `classify_package_signing()`, which reports UNKNOWN for that case.
+
+    Args:
+      package: A dict representing a package entry from packages.txt.
+
+    Returns:
+      A list of SHA-256 hex digest strings ordered [oldest_ancestor, ..., current_signer],
+      or [] if co-signed or unavailable.
+    """
+    if not HubbleParser.has_structured_signing_info(package):
+      return []
+    signing_info = package["signingInfo"]
+    if signing_info.get("hasMultipleSigners", False):
+      return []
+    lineage = signing_info.get("signingCertificateLineage")
+    if isinstance(lineage, list):
+      return list(lineage)
+    return []
+
+  @staticmethod
+  def get_past_signing_certificates(package):
+    """Returns historical ancestor signing certificates excluding the active signer.
+
+    Args:
+      package: A dict representing a package entry from packages.txt.
+
+    Returns:
+      A list of retired/past ancestor SHA-256 certificate digests ordered from
+      oldest ancestor to most recent predecessor, or [] if the package has not
+      undergone key rotation or is co-signed.
+    """
+    lineage = HubbleParser.get_signing_lineage(package)
+    if len(lineage) > 1:
+      return lineage[:-1]
+    return []
+
+  @staticmethod
+  def classify_package_signing(package, logger=None):
+    """Classifies a package's signing configuration (lineage vs. co-signing).
+
+    Distinguishes between:
+    1. SINGLE_SIGNER: Signed by a single certificate with no key rotation history
+       (hasMultipleSigners=False, hasPastSigningCertificates=False).
+    2. KEY_ROTATION_LINEAGE: Signed by a single active certificate with one or
+       more past ancestor certificates in its v3 signing lineage
+       (hasMultipleSigners=False, hasPastSigningCertificates=True).
+    3. MULTIPLE_SIGNERS: Co-signed simultaneously by multiple active signers
+       (hasMultipleSigners=True).
+    4. UNKNOWN: The signing configuration cannot be determined. This covers:
+       (a) every package in a legacy (schema < 2.2.0) observation, where
+       `signingInfo` does not exist and `certIds` alone cannot distinguish a
+       rotation lineage from a set of co-signers; (b) a package collected on
+       API < 28, where PackageManager exposes no v3 lineage API and Hubble
+       therefore emits `hasPastSigningCertificates: null` - "not rotated" is
+       unobservable there, not false; (c) missing or malformed metadata.
+       Co-signing is still reported affirmatively on API < 28, since the
+       signer count itself is observable.
+
+    Args:
+      package: A dict representing a package entry from packages.txt.
+      logger: Optional logging.Logger to emit warnings on missing signingInfo.
+
+    Returns:
+      One of the SIGNING_MODE_* string constants.
+    """
+    if not isinstance(package, dict):
+      return HubbleParser.SIGNING_MODE_UNKNOWN
+
+    if not HubbleParser.has_structured_signing_info(package):
+      if logger:
+        logger.debug(
+            "Package %s has no structured signingInfo (legacy Hubble output "
+            "< %s); classifying signing mode as UNKNOWN",
+            package.get("name", "<unknown>"),
+            HubbleParser.SIGNING_INFO_MIN_VERSION)
+      return HubbleParser.SIGNING_MODE_UNKNOWN
+    signing_info = package["signingInfo"]
+
+    has_multiple = bool(signing_info.get("hasMultipleSigners", False))
+    # Tri-state: Hubble emits null on API < 28, where PackageManager exposes no
+    # v3 lineage API and "not rotated" is therefore unobservable, not false.
+    has_past_raw = signing_info.get("hasPastSigningCertificates")
+    rotation_state_known = isinstance(has_past_raw, bool)
+    has_past = has_past_raw is True
+    active_signers = signing_info.get("apkContentsSigners")
+    if not isinstance(active_signers, list):
+      active_signers = []
+    lineage = HubbleParser.get_signing_lineage(package)
+
+    if not active_signers and not lineage:
+      if logger:
+        logger.warning(
+            "Package %s has empty signingInfo certificates; "
+            "classifying signing mode as UNKNOWN",
+            package.get("name", "<unknown>"))
+      return HubbleParser.SIGNING_MODE_UNKNOWN
+
+    # Checked first: a signer count > 1 is directly observable on every API
+    # level, so co-signing is affirmative even when rotation state is not.
+    if has_multiple or len(active_signers) > 1:
+      return HubbleParser.SIGNING_MODE_MULTIPLE_SIGNERS
+
+    if has_past or len(lineage) > 1:
+      return HubbleParser.SIGNING_MODE_KEY_ROTATION_LINEAGE
+
+    if not rotation_state_known:
+      if logger:
+        logger.debug(
+            "Package %s has an unobservable key rotation state (API < 28); "
+            "classifying signing mode as UNKNOWN",
+            package.get("name", "<unknown>"))
+      return HubbleParser.SIGNING_MODE_UNKNOWN
+
+    if len(active_signers) == 1 or len(lineage) == 1:
+      return HubbleParser.SIGNING_MODE_SINGLE_SIGNER
+
+    return HubbleParser.SIGNING_MODE_UNKNOWN
 
   @staticmethod
   def classify_package(package, logger=None):
@@ -167,25 +385,63 @@ class HubbleParser:
     else:
       return HubbleParser.PACKAGE_STATE_USER_INSTALLED
 
+  @staticmethod
+  def get_package_certificate_set(package):
+    """Returns every signing certificate ever associated with a package.
+
+    This is the union of the package's rotation lineage, its active signer(s),
+    and the flat `certIds` list, i.e. both current AND retired certificates.
+
+    WARNING: This set is only meaningful as the *trust anchor* side of a
+    comparison (e.g. "the set of certificates that identify the platform"). Do
+    NOT use it for the candidate package side: a package that has rotated AWAY
+    from a trusted key still contains that key in its lineage, so intersecting
+    two full certificate sets would treat it as still trusted. For the candidate
+    side use `get_active_signers()`; see `is_platform_signed()`.
+    """
+    if not isinstance(package, dict):
+      return set()
+    certs = (
+        set(HubbleParser.get_signing_lineage(package))
+        | set(HubbleParser.get_active_signers(package))
+    )
+    cert_ids = package.get("certIds")
+    if isinstance(cert_ids, list):
+      certs.update(cert_ids)
+    return certs
+
   def __init__(self, logger, normalize=False):
-    self.packages = []
+    self._packages = []
     self.preinstalled_packages = []
     self.certificates = ""
     self.device_properties = ""
     self.build = ""
     self.hardware = ""
     # TODO: Remove legacy risk-scoring and baseline-categorization attributes
-    # (scorer, normalize, _platform_signature, _shared_uid_packages) as legacy
-    # categorization of Uraniborg results is no longer supported.
+    # (scorer, normalize, _platform_signature, _platform_signatures,
+    # _shared_uid_packages) as legacy categorization of Uraniborg results is no
+    # longer supported.
     self.scorer = None
     self.normalize = normalize
     self.logger = logger
     self._platform_signature = ""
+    self._platform_signatures = None
     self._shared_uid_packages = None
     self._output_version = None
 
     # do a bit of sanity check
     logger.debug("normalize: %s", self.normalize)
+
+  @property
+  def packages(self):
+    return self._packages
+
+  @packages.setter
+  def packages(self, value):
+    self._packages = value
+    self._platform_signature = ""
+    self._platform_signatures = None
+    self._shared_uid_packages = None
 
   def parse_hubble_json(self, packages, build, hardware,
                         preinstalled_packages=None):
@@ -227,6 +483,9 @@ class HubbleParser:
     """
     logger = self.logger
     self._output_version = None
+    self._platform_signature = ""
+    self._platform_signatures = None
+    self._shared_uid_packages = None
     output_files = os.listdir(directory)
     if not output_files:
       logger.error("%s is empty!", directory)
@@ -270,15 +529,15 @@ class HubbleParser:
     return self.build["apiLevel"]
 
   # TODO: Remove legacy baseline/whitelist/scoring package categorization
-  # methods (get_shared_uid_packages, get_platform_signature,
-  # get_platform_packages, print_platform_packages, print_nocode_packages) as
-  # legacy categorization of Uraniborg results is no longer supported.
+  # methods (get_package_certificate_set, get_shared_uid_packages,
+  # get_platform_signatures, get_platform_signature, get_platform_packages,
+  # print_platform_packages, print_nocode_packages) as legacy categorization of
+  # Uraniborg results is no longer supported.
   def get_shared_uid_packages(self):
     if not self._shared_uid_packages:
-      platform_signature = self.get_platform_signature()
       self._shared_uid_packages = dict()
       for package in self.packages:
-        if platform_signature in package["certIds"]:
+        if self.is_platform_signed(package):
           package_shared_uid = package["sharedUserId"]
           if package_shared_uid is not None:
             other_packages = self._shared_uid_packages.get(package_shared_uid)
@@ -290,12 +549,110 @@ class HubbleParser:
 
     return self._shared_uid_packages
 
+  def get_platform_signatures(self):
+    """Returns the platform's full signing identity (lineage union active signers).
+
+    This is the trust-anchor set: every certificate the `android` framework
+    package has ever been signed by, so that a platform key rotation does not
+    orphan system packages still signed with a retired platform certificate.
+    """
+    if self._platform_signatures is None:
+      self._platform_signatures = set()
+      for package in self.packages:
+        if package["name"] == HubbleParser.PLATFORM_PACKAGE_NAME:
+          self._platform_signatures = self.get_package_certificate_set(package)
+          break
+
+    return self._platform_signatures
+
+  @staticmethod
+  def get_platform_signature_match(package):
+    """Returns the recorded `PackageManager.checkSignatures(pkg, "android")` verdict.
+
+    Present only in Hubble >= 2.2.0 output. This is descriptive metadata: it is
+    what `PackageManager` itself would report to an app, which is useful when
+    reasoning about legacy callers of that API. It is NOT used to decide platform
+    signing - see `is_platform_signed()` for why.
+
+    Args:
+      package: A dict representing a package entry from packages.txt.
+
+    Returns:
+      One of "MATCH", "NO_MATCH", "NEITHER_SIGNED", "FIRST_NOT_SIGNED",
+      "SECOND_NOT_SIGNED", "UNKNOWN_PACKAGE", "UNKNOWN", or None if unavailable.
+    """
+    if not HubbleParser.has_structured_signing_info(package):
+      return None
+    return package["signingInfo"].get("platformSignatureMatch")
+
+  def is_platform_signed(self, package):
+    """Returns True if `package` shares a signing identity with the platform.
+
+    Uses a directional comparison: the package's *active* signer(s) against the
+    platform's *full* lineage (`get_platform_signatures()`). It deliberately does
+    NOT consider the package's own retired certificates, so a package that has
+    rotated away from the platform key is correctly no longer treated as
+    platform-signed.
+
+    Why `signingInfo.platformSignatureMatch` is deliberately NOT used here:
+
+    `PackageManager.checkSignatures()` is a legacy, pre-rotation-compatible API,
+    not a capability-aware trust decision. Per AOSP
+    `ComputerEngine.checkSignaturesInternal()` it (1) compares the two packages'
+    *current* signer sets for exact set equality, then (2) on failure, if either
+    side has a lineage, retries using only the *oldest* ancestor of each. It
+    never calls `SigningDetails.checkCapability()`. That makes it unsound in both
+    directions for this question:
+
+      - False positive: a package that rotated AWAY from the platform key still
+        reports MATCH, because step (2) compares the retired platform cert.
+        Trusting it would reintroduce exactly the bug this method avoids.
+      - False negative: a package co-signed by the platform key PLUS another key
+        reports NO_MATCH, because step (1) demands exact set equality.
+
+    Use `get_platform_signature_match()` if you specifically want that verdict.
+
+    KNOWN LIMITATION: neither approach can see the per-ancestor
+    `SigningDetails.CertCapabilities` flags (`PERMISSION`, `SHARED_USER_ID`) that
+    a key rotation may revoke. The framework evaluates those in its shared-UID
+    join logic and permission subsystem, and they are not reachable from any
+    public API, so Hubble cannot observe them. A retired platform certificate
+    whose capabilities were revoked is therefore indistinguishable here from one
+    that retains them, and this method may over-approximate platform trust
+    accordingly.
+
+    Args:
+      package: A dict representing a package entry from packages.txt.
+
+    Returns:
+      True if the package is platform-signed, False otherwise.
+    """
+    if not isinstance(package, dict):
+      return False
+
+    platform_signatures = self.get_platform_signatures()
+    if not platform_signatures:
+      return False
+    return bool(platform_signatures & set(self.get_active_signers(package)))
 
   def get_platform_signature(self):
+    """Returns the active platform signing certificate digest.
+
+    Deprecated: Prefer `is_platform_signed()` for platform matching, or
+    `get_platform_signatures()` for the full lineage-aware trust-anchor set when
+    the `android` framework signing key has rotated.
+
+    NOTE: For Hubble >= 2.2.0 this is the *currently active* platform signer. For
+    legacy (< 2.2.0) output it degrades to `certIds[0]`, which for a rotated key
+    is the OLDEST ancestor - matching the historical behaviour of this method.
+    """
     if not self._platform_signature:
       for package in self.packages:
-        if package["name"] == "android":
-          self._platform_signature = package["certIds"][0]
+        if package["name"] == HubbleParser.PLATFORM_PACKAGE_NAME:
+          active_signers = self.get_active_signers(package)
+          if active_signers:
+            self._platform_signature = active_signers[0]
+          break
 
     return self._platform_signature
 
@@ -308,9 +665,8 @@ class HubbleParser:
 
   def get_platform_packages(self, get_codes_only):
     result = []
-    platform_signature = self.get_platform_signature()
     for package in self.packages:
-      if platform_signature in package["certIds"]:
+      if self.is_platform_signed(package):
         if not get_codes_only or package["hasCode"]:
           result.append(package["name"])
     return result
@@ -321,9 +677,8 @@ class HubbleParser:
         print("        \"{}\",".format(package["name"]))
 
   def print_platform_packages(self, print_codes_only):
-    platform_signature = self.get_platform_signature()
     for package in self.packages:
-      if platform_signature in package["certIds"]:
+      if self.is_platform_signed(package):
         if not print_codes_only or package["hasCode"]:
           print("        \"{}\",".format(package["name"]))
 
@@ -347,6 +702,27 @@ class HubbleParser:
           "Full package list (packages.txt) is not loaded; "
           "cannot query user-installed packages.")
     return []
+
+  def get_packages_by_signing_mode(self, signing_mode, get_codes_only=False):
+    """Returns a list of package names matching a specific signing mode."""
+    result = []
+    for package in self._get_package_list(allow_preinstalled_fallback=True):
+      if self.classify_package_signing(package, self.logger) == signing_mode:
+        if not get_codes_only or package.get("hasCode", True):
+          result.append(package["name"])
+    return result
+
+  def get_key_rotated_packages(self, get_codes_only=False):
+    """Returns a list of packages with a v3 signing certificate rotation lineage."""
+    return self.get_packages_by_signing_mode(
+        HubbleParser.SIGNING_MODE_KEY_ROTATION_LINEAGE,
+        get_codes_only=get_codes_only)
+
+  def get_cosigned_packages(self, get_codes_only=False):
+    """Returns a list of packages co-signed by multiple active signers."""
+    return self.get_packages_by_signing_mode(
+        HubbleParser.SIGNING_MODE_MULTIPLE_SIGNERS,
+        get_codes_only=get_codes_only)
 
   def get_preinstalled_packages(self, get_codes_only=False):
     """Returns a list of preinstalled package names."""

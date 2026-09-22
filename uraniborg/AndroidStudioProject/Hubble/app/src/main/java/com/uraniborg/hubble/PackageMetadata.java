@@ -49,7 +49,8 @@ public class PackageMetadata extends BaseInfo {
   protected CharSequence description = null;
   protected int versionCode;
   protected String versionName;
-  protected JSONArray certIds;
+  protected JSONArray certIds = new JSONArray();
+  protected JSONObject signingInfo = null;
   protected boolean isEnabled = false;
   protected boolean isTestOnly = false;
   protected boolean isFactoryTest = false;

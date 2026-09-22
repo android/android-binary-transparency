@@ -37,7 +37,9 @@ Unit tests for the Python automation and verification scripts are located in
   parsing `preinstalled_packages.txt`, 6-state package classification
   (`FACTORY_PREINSTALLED_APK`, `FACTORY_PREINSTALLED_APEX`,
   `UPDATED_SYSTEM_APP`, `UPDATED_MAINLINE_MODULE`, `USER_INSTALLED`,
-  `UNKNOWN`), and package query/filtering methods.
+  `UNKNOWN`), signing certificate lineage vs. co-signing classification
+  (`SINGLE_SIGNER`, `KEY_ROTATION_LINEAGE`, `MULTIPLE_SIGNERS`), and package
+  query/filtering methods.
 - `test_inclusion_proof_check.py`: Tests pre-fetching transparency log entries
   (`--cache_prefetch_concurrency`, `--cache_prefetch_timeout`, `--cache_dir`),
   opt-out (`--no_prefetch`), fail-open fallback on pre-fetch errors/timeouts,
@@ -70,6 +72,11 @@ build.gradle file of the Hubble app.
 > intentionally break compatibility; output files produced by Hubble `1.0.0`
 > (or any version `< 2.1.0`) and higher major versions (`>= 3.0.0`) are **not
 > supported**.
+>
+> Minor versions within `2.x` are **additive** and are read on a best-effort
+> basis, so previously collected corpora stay readable. For example `2.2.0`
+> adds the `signingInfo` object; when reading `2.1.0` output the signing-mode
+> helpers report `UNKNOWN` instead of rejecting the observation.
 
 <!-- TODO: Remove legacy risk-scoring documentation (docs/Uraniborg's Preloaded App Risks Scoring Metrics (2020-08) v1.0.pdf) and remaining legacy result categorization helpers in hubble_parser.py / automate_observation.py. -->
 
