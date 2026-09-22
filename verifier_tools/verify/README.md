@@ -19,7 +19,7 @@ See the particular section for this tool:
   * Internal libraries for the verifier binary.
 
 ## Build
-This module requires Go 1.24. Install [here](https://go.dev/doc/install), and run `go build cmd/verifier/verifier.go`.
+This module requires Go 1.25+. Install [here](https://go.dev/doc/install), and run `go build cmd/verifier/verifier.go`.
 
 An executable named `verifier` should be produced upon successful build.
 
