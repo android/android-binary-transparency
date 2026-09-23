@@ -19,6 +19,7 @@
 package checkpoint
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -32,7 +33,9 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/android/android-binary-transparency/verifier_tools/verify/internal/httpclient"
 	"golang.org/x/mod/sumdb/note"
 )
 
@@ -166,7 +169,17 @@ func parseCheckpoint(ckpt string) (Root, error) {
 	return Root{Size: size, Hash: rh}, nil
 }
 
+const (
+	defaultHTTPTimeout = 30 * time.Second
+)
+
+var httpClient = httpclient.New(defaultHTTPTimeout)
+
 func getSignedCheckpoint(logURL, checkpointPath string) ([]byte, error) {
+	return getSignedCheckpointContext(context.Background(), logURL, checkpointPath)
+}
+
+func getSignedCheckpointContext(ctx context.Context, logURL, checkpointPath string) ([]byte, error) {
 	// Sanity check the input url.
 	u, err := url.Parse(logURL)
 	if err != nil {
@@ -175,9 +188,14 @@ func getSignedCheckpoint(logURL, checkpointPath string) ([]byte, error) {
 
 	u.Path = path.Join(u.Path, checkpointPath)
 
-	resp, err := http.Get(u.String())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return []byte{}, fmt.Errorf("http.Get(%s): %v", u, err)
+		return []byte{}, fmt.Errorf("http.NewRequestWithContext(%s): %w", u, err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return []byte{}, fmt.Errorf("http.Get(%s): %w", u, err)
 	}
 	defer resp.Body.Close()
 	if code := resp.StatusCode; code != 200 {
@@ -187,11 +205,14 @@ func getSignedCheckpoint(logURL, checkpointPath string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// FromURLWithPath verifies the signature and unpacks and returns a Root from the given checkpoint path.
-func FromURLWithPath(logURL, checkpointPath string, v note.Verifier) (Root, error) {
-	b, err := getSignedCheckpoint(logURL, checkpointPath)
+// FromURLWithPathContext verifies the signature and unpacks and returns a Root from the given checkpoint path using ctx.
+func FromURLWithPathContext(ctx context.Context, logURL, checkpointPath string, v note.Verifier) (Root, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b, err := getSignedCheckpointContext(ctx, logURL, checkpointPath)
 	if err != nil {
-		return Root{}, fmt.Errorf("failed to get signed checkpoint: %v", err)
+		return Root{}, fmt.Errorf("failed to get signed checkpoint: %w", err)
 	}
 
 	n, err := note.Open(b, note.VerifierList(v))
@@ -199,6 +220,11 @@ func FromURLWithPath(logURL, checkpointPath string, v note.Verifier) (Root, erro
 		return Root{}, fmt.Errorf("failed to verify note signatures: %v", err)
 	}
 	return parseCheckpoint(n.Text)
+}
+
+// FromURLWithPath verifies the signature and unpacks and returns a Root from the given checkpoint path.
+func FromURLWithPath(logURL, checkpointPath string, v note.Verifier) (Root, error) {
+	return FromURLWithPathContext(context.Background(), logURL, checkpointPath, v)
 }
 
 // FromURL verifies the signature and unpacks and returns a Root.

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/android/android-binary-transparency/verifier_tools/verify/internal/httpclient"
 	"golang.org/x/mod/sumdb/tlog"
 )
 
@@ -120,33 +120,12 @@ func BinaryInfosIndex(logBaseURL string, binaryInfoFilename string, treeSize int
 	return parseBinaryInfosIndex(binaryInfos, binaryInfoFilename)
 }
 
-const (
-	defaultHTTPTimeout           = 5 * time.Minute
-	defaultResponseHeaderTimeout = 30 * time.Second
-	defaultDialTimeout           = 10 * time.Second
-	defaultTLSHandshakeTimeout   = 10 * time.Second
-)
+const defaultHTTPTimeout = 5 * time.Minute
 
-var httpClient = &http.Client{
-	// Timeout covers the entire request including reading large legacy binary info
-	// response bodies (e.g. ~210 MB package_info.txt), while Transport timeouts bound
-	// connection establishment and waiting for response headers.
-	Timeout: defaultHTTPTimeout,
-	Transport: &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   defaultDialTimeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   32,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   defaultTLSHandshakeTimeout,
-		ResponseHeaderTimeout: defaultResponseHeaderTimeout,
-		ExpectContinueTimeout: 1 * time.Second,
-	},
-}
+// Timeout covers the entire request including reading large legacy binary info
+// response bodies (e.g. ~210 MB package_info.txt), while Transport timeouts bound
+// connection establishment and waiting for response headers.
+var httpClient = httpclient.New(defaultHTTPTimeout)
 
 var (
 	customCacheDirMu sync.RWMutex

@@ -1,11 +1,14 @@
 package checkpoint
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -170,5 +173,34 @@ func TestValidCheckpointFormat(t *testing.T) {
 				t.Errorf("got size %d, want %d", root.Size, tt.wantSize)
 			}
 		})
+	}
+}
+
+func TestHTTPClientTimeoutAndContextCancellation(t *testing.T) {
+	if httpClient.Timeout != defaultHTTPTimeout {
+		t.Errorf("httpClient.Timeout = %v, want %v", httpClient.Timeout, defaultHTTPTimeout)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Block until client request context is cancelled or times out.
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	// 1. Caller context timeout aborts promptly and preserves context.DeadlineExceeded.
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if _, err := getSignedCheckpointContext(ctx, server.URL, "checkpoint.txt"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context.DeadlineExceeded when checkpoint fetch times out, got %v", err)
+	}
+
+	// 2. httpClient.Timeout aborts hanging server even with context.Background().
+	origTimeout := httpClient.Timeout
+	httpClient.Timeout = 40 * time.Millisecond
+	defer func() {
+		httpClient.Timeout = origTimeout
+	}()
+	if _, err := getSignedCheckpoint(server.URL, "checkpoint.txt"); err == nil {
+		t.Errorf("expected error when server exceeds httpClient.Timeout, got nil")
 	}
 }
