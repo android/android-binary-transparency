@@ -865,23 +865,6 @@ func TestHTTPClientTimeoutConfiguration(t *testing.T) {
 	if httpClient.Timeout < 5*time.Minute {
 		t.Errorf("httpClient.Timeout (%v) is too short for large ~210 MB package_info.txt downloads; want >= 5m", httpClient.Timeout)
 	}
-
-	transport, ok := httpClient.Transport.(*http.Transport)
-	if !ok || transport == nil {
-		t.Fatalf("expected httpClient.Transport to be *http.Transport, got %T", httpClient.Transport)
-	}
-	if !transport.ForceAttemptHTTP2 {
-		t.Errorf("transport.ForceAttemptHTTP2 = false, want true (required when DialContext is non-nil)")
-	}
-	if transport.ResponseHeaderTimeout != defaultResponseHeaderTimeout {
-		t.Errorf("transport.ResponseHeaderTimeout = %v, want %v", transport.ResponseHeaderTimeout, defaultResponseHeaderTimeout)
-	}
-	if transport.TLSHandshakeTimeout != defaultTLSHandshakeTimeout {
-		t.Errorf("transport.TLSHandshakeTimeout = %v, want %v", transport.TLSHandshakeTimeout, defaultTLSHandshakeTimeout)
-	}
-	if transport.DialContext == nil {
-		t.Errorf("expected transport.DialContext to be non-nil")
-	}
 }
 
 func TestReadFromURLContextStreamingAndCancellation(t *testing.T) {

@@ -240,7 +240,7 @@ func resolveTargets(logType string) ([]logTarget, error) {
 func runFetchEntries(ctx context.Context, targets []logTarget, concurrency int) error {
 	for _, target := range targets {
 		slog.Info("Syncing entries for log", "log", target.name, "url", target.baseURL)
-		root, err := checkpoint.FromURLWithPath(target.baseURL, target.checkpointPath, target.verifier)
+		root, err := checkpoint.FromURLWithPathContext(ctx, target.baseURL, target.checkpointPath, target.verifier)
 		if err != nil {
 			return fmt.Errorf("failed to read checkpoint for %s: %w", target.name, err)
 		}
@@ -278,10 +278,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *fetchEntries {
-		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer cancel()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
+	if *fetchEntries {
 		if err := runFetchEntries(ctx, targets, *concurrency); err != nil {
 			slog.Error("FAILURE: error fetching entries", "error", err)
 			os.Exit(1)
@@ -311,7 +311,7 @@ func main() {
 	var verified bool
 	for _, target := range targets {
 		slog.Info("Checking log", "log", target.name, "url", target.baseURL)
-		root, err := checkpoint.FromURLWithPath(target.baseURL, target.checkpointPath, target.verifier)
+		root, err := checkpoint.FromURLWithPathContext(ctx, target.baseURL, target.checkpointPath, target.verifier)
 		if err != nil {
 			slog.Warn("Failed to read checkpoint", "log", target.name, "error", err)
 			continue
