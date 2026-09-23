@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -119,14 +120,30 @@ func BinaryInfosIndex(logBaseURL string, binaryInfoFilename string, treeSize int
 	return parseBinaryInfosIndex(binaryInfos, binaryInfoFilename)
 }
 
+const (
+	defaultHTTPTimeout           = 5 * time.Minute
+	defaultResponseHeaderTimeout = 30 * time.Second
+	defaultDialTimeout           = 10 * time.Second
+	defaultTLSHandshakeTimeout   = 10 * time.Second
+)
+
 var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
+	// Timeout covers the entire request including reading large legacy binary info
+	// response bodies (e.g. ~210 MB package_info.txt), while Transport timeouts bound
+	// connection establishment and waiting for response headers.
+	Timeout: defaultHTTPTimeout,
 	Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   defaultDialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   defaultTLSHandshakeTimeout,
+		ResponseHeaderTimeout: defaultResponseHeaderTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 	},
 }
@@ -331,12 +348,12 @@ func readFromURLContext(ctx context.Context, base, suffix string) ([]byte, error
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("http.NewRequestWithContext(%s): %v", u.String(), err)
+		return nil, fmt.Errorf("http.NewRequestWithContext(%s): %w", u.String(), err)
 	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("httpClient.Do(%s): %v", u.String(), err)
+		return nil, fmt.Errorf("httpClient.Do(%s): %w", u.String(), err)
 	}
 	defer resp.Body.Close()
 	if code := resp.StatusCode; code != 200 {

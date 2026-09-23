@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -854,5 +855,98 @@ func TestLegacyCacheEviction(t *testing.T) {
 	newCache := filepath.Join(targetDir, "package_info.txt_3")
 	if _, err := os.Stat(newCache); err != nil {
 		t.Errorf("expected newly downloaded cache file %s to exist, err: %v", newCache, err)
+	}
+}
+
+func TestHTTPClientTimeoutConfiguration(t *testing.T) {
+	if httpClient.Timeout != defaultHTTPTimeout {
+		t.Errorf("httpClient.Timeout = %v, want %v", httpClient.Timeout, defaultHTTPTimeout)
+	}
+	if httpClient.Timeout < 5*time.Minute {
+		t.Errorf("httpClient.Timeout (%v) is too short for large ~210 MB package_info.txt downloads; want >= 5m", httpClient.Timeout)
+	}
+
+	transport, ok := httpClient.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("expected httpClient.Transport to be *http.Transport, got %T", httpClient.Transport)
+	}
+	if !transport.ForceAttemptHTTP2 {
+		t.Errorf("transport.ForceAttemptHTTP2 = false, want true (required when DialContext is non-nil)")
+	}
+	if transport.ResponseHeaderTimeout != defaultResponseHeaderTimeout {
+		t.Errorf("transport.ResponseHeaderTimeout = %v, want %v", transport.ResponseHeaderTimeout, defaultResponseHeaderTimeout)
+	}
+	if transport.TLSHandshakeTimeout != defaultTLSHandshakeTimeout {
+		t.Errorf("transport.TLSHandshakeTimeout = %v, want %v", transport.TLSHandshakeTimeout, defaultTLSHandshakeTimeout)
+	}
+	if transport.DialContext == nil {
+		t.Errorf("expected transport.DialContext to be non-nil")
+	}
+}
+
+func TestReadFromURLContextStreamingAndCancellation(t *testing.T) {
+	origTransport := httpClient.Transport.(*http.Transport)
+	clonedTransport := origTransport.Clone()
+	clonedTransport.ResponseHeaderTimeout = 150 * time.Millisecond
+	httpClient.Transport = clonedTransport
+	defer func() {
+		httpClient.Transport = origTransport
+	}()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		switch r.URL.Path {
+		case "/stream_exceeds_header_timeout":
+			// Send headers immediately (< 150ms ResponseHeaderTimeout), then stream body
+			// for ~200ms (> 150ms ResponseHeaderTimeout, but < httpClient.Timeout).
+			w.WriteHeader(http.StatusOK)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			for i := 0; i < 4; i++ {
+				time.Sleep(50 * time.Millisecond)
+				_, _ = w.Write([]byte("chunk\n"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		case "/slow_headers":
+			// Delay response headers past ResponseHeaderTimeout (150ms) until client aborts.
+			<-r.Context().Done()
+		case "/stream_slow":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("initial\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			// Wait until client cancels context
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	// 1. Streaming body that takes longer than ResponseHeaderTimeout succeeds
+	// once response headers are received promptly.
+	got, err := readFromURLContext(context.Background(), server.URL, "stream_exceeds_header_timeout")
+	if err != nil {
+		t.Fatalf("readFromURLContext(stream_exceeds_header_timeout) failed: %v", err)
+	}
+	want := "chunk\nchunk\nchunk\nchunk\n"
+	if string(got) != want {
+		t.Errorf("got %q, want %q", string(got), want)
+	}
+
+	// 2. Server that fails to send headers within ResponseHeaderTimeout fails even with context.Background().
+	if _, err := readFromURLContext(context.Background(), server.URL, "slow_headers"); err == nil {
+		t.Errorf("expected error when server exceeds ResponseHeaderTimeout, got nil")
+	}
+
+	// 3. Caller context deadline (40ms << 150ms ResponseHeaderTimeout) during body streaming aborts promptly.
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if _, err := readFromURLContext(ctx, server.URL, "stream_slow"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context.DeadlineExceeded when caller deadline expires while reading body, got %v", err)
 	}
 }
