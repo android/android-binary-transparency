@@ -41,6 +41,8 @@ const (
 	originIDPixel = "developers.google.com/android/binary_transparency/0\n"
 	// originIDG1P identifies a checkpoint for the Google System APK Transparency Log.
 	originIDG1P = "developers.google.com/android/binary_transparency/google1p/0\n"
+	// originIDG1PJWT202601 identifies a checkpoint for the Google System APK Transparency Log (2026/01 shard).
+	originIDG1PJWT202601 = "gstatic.com/android/binary_transparency/google1p/jwt/0\n"
 	// originIDG1PAPK identifies a checkpoint for the Google 1P APK Transparency Log.
 	originIDG1PAPK = "gstatic.com/android/binary_transparency/google1p/apk/2026/0\n"
 	// originIDG1PAPKTessera identifies a checkpoint for the Google 1P APK Transparency Log (Tessera shard).
@@ -123,6 +125,8 @@ func parseCheckpoint(ckpt string) (Root, error) {
 		body = ckpt[len(originIDPixel):]
 	case strings.HasPrefix(ckpt, originIDG1P):
 		body = ckpt[len(originIDG1P):]
+	case strings.HasPrefix(ckpt, originIDG1PJWT202601):
+		body = ckpt[len(originIDG1PJWT202601):]
 	case strings.HasPrefix(ckpt, originIDG1PAPK):
 		body = ckpt[len(originIDG1PAPK):]
 	case strings.HasPrefix(ckpt, originIDG1PAPKTessera):
@@ -132,9 +136,10 @@ func parseCheckpoint(ckpt string) (Root, error) {
 	case strings.HasPrefix(ckpt, originIDMainlineModuleTessera):
 		body = ckpt[len(originIDMainlineModuleTessera):]
 	default:
-		return Root{}, fmt.Errorf("invalid checkpoint - unknown origin, must be either %s, %s, %s, %s, %s, or %s",
+		return Root{}, fmt.Errorf("invalid checkpoint - unknown origin, must be either %s, %s, %s, %s, %s, %s, or %s",
 			strings.TrimSpace(originIDPixel),
 			strings.TrimSpace(originIDG1P),
+			strings.TrimSpace(originIDG1PJWT202601),
 			strings.TrimSpace(originIDG1PAPK),
 			strings.TrimSpace(originIDG1PAPKTessera),
 			strings.TrimSpace(originIDMainlineModule),

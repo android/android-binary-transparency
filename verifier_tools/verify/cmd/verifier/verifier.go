@@ -43,10 +43,12 @@ const (
 	LeafHashPrefix                   = 0
 	KeyNameForVerifierPixel          = "pixel_transparency_log"
 	KeyNameForVerifierG1PJWT         = "developers.google.com/android/binary_transparency/google1p/0"
+	KeyNameForVerifierG1PJWT202601   = "gstatic.com/android/binary_transparency/google1p/jwt/0"
 	KeyNameForVerifierG1PAPK         = "gstatic.com/android/binary_transparency/google1p/apk/2026/0"
 	KeyNameForVerifierMainlineModule = "gstatic.com/android/binary_transparency/mainline/modules/2026/0"
 	LogBaseURLPixel                  = "https://developers.google.com/android/binary_transparency"
 	LogBaseURLG1PJWT                 = "https://developers.google.com/android/binary_transparency/google1p"
+	LogBaseURLG1PJWT202601           = "https://www.gstatic.com/android/binary_transparency/google1p/jwt/2026/01"
 	LogBaseURLG1PAPK202601           = "https://www.gstatic.com/android/binary_transparency/google1p/apk/2026/01"
 	LogBaseURLG1PAPK202602           = "https://www.gstatic.com/android/binary_transparency/google1p/apk/2026/02"
 	NoteVerifierG1PAPK202602         = "android.transparency.goog/google1p/apk/2026/1+fc654374+ATr9NQE0gvOtVfj5cCStUzdlflEp3oZoNHD8pImzPj5O"
@@ -142,15 +144,31 @@ func resolveTargets(logType string) ([]logTarget, error) {
 			binaryInfoFilenames: []string{ImageInfoFilename},
 		})
 	case "google_1p_code":
-		v, err := checkpoint.NewVerifier(googleSystemAppLogPubKey, KeyNameForVerifierG1PJWT)
+		// Shard 2026/01: Latest sharded log
+		v202601, err := checkpoint.NewVerifier(googleSystemAppLogPubKey, KeyNameForVerifierG1PJWT202601)
 		if err != nil {
-			return nil, fmt.Errorf("error creating verifier for google_1p_code log: %w", err)
+			return nil, fmt.Errorf("error creating verifier for 2026/01 google_1p_code log: %w", err)
 		}
 		targets = append(targets, logTarget{
-			name:                "google_1p_code",
+			name:                "google_1p_code (2026/01)",
+			baseURL:             LogBaseURLG1PJWT202601,
+			checkpointPath:      "checkpoint.txt",
+			verifier:            v202601,
+			tileHeight:          8,
+			isTessera:           false,
+			binaryInfoFilenames: []string{PackageInfoFilename},
+		})
+
+		// Legacy log continuation fallback
+		vLegacy, err := checkpoint.NewVerifier(googleSystemAppLogPubKey, KeyNameForVerifierG1PJWT)
+		if err != nil {
+			return nil, fmt.Errorf("error creating verifier for legacy google_1p_code log: %w", err)
+		}
+		targets = append(targets, logTarget{
+			name:                "google_1p_code (legacy)",
 			baseURL:             LogBaseURLG1PJWT,
 			checkpointPath:      "checkpoint.txt",
-			verifier:            v,
+			verifier:            vLegacy,
 			tileHeight:          1,
 			isTessera:           false,
 			binaryInfoFilenames: []string{PackageInfoFilename},
