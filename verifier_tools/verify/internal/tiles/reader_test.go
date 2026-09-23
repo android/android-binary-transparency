@@ -638,6 +638,10 @@ func TestLogDirFromURL(t *testing.T) {
 			want: "google1p",
 		},
 		{
+			url:  "https://www.gstatic.com/android/binary_transparency/google1p/jwt/2026/01",
+			want: filepath.FromSlash("google1p/jwt/2026/01"),
+		},
+		{
 			url:  "https://www.gstatic.com/android/binary_transparency/google1p/apk/2026/01",
 			want: filepath.FromSlash("google1p/apk/2026/01"),
 		},
