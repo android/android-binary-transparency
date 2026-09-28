@@ -27,6 +27,21 @@ If you see the final SUCCESS message, feel free to ignore earlier ERROR messages
 Those resulted from some files that cannot be extracted from device, but does not
 affect the core files required for further analysis.
 
+### Selecting Devices
+
+By default, the script observes **every** device listed by `adb devices`, one
+after another. To observe only specific devices, pass their serial numbers with
+`-s`/`--serial`. The flag may be repeated, and devices are processed in the
+order given:
+
+```bash
+python3 automate_observation.py --serial ABCDEF012345 --serial 9876543210FEDCBA
+```
+
+A requested serial that is not connected is not silently skipped: it is logged
+as an error, reported as `FAILED` in the final summary, and makes the script
+exit with code `1`. The remaining requested devices are still observed.
+
 ## Performing Inclusion Proof Checks
 
 You can automatically verify extracted package APK splits against Android Binary

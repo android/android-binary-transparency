@@ -68,6 +68,14 @@ def parse_arguments() -> argparse.Namespace:
                       "\"results\" directory can be found.")
   parser.add_argument("-D", "--debug", required=False, action="count",
                       help="If specified, debugging mode is turned on.")
+  parser.add_argument("-s", "--serial", required=False, action="append",
+                      default=None, metavar="SERIAL",
+                      help="Serial number of a connected device to observe "
+                           "(as listed by `adb devices`). May be repeated to "
+                           "observe several devices, which are processed in "
+                           "the order given. If omitted, every connected "
+                           "device is observed. A requested serial that is "
+                           "not connected is reported as FAILED.")
   parser.add_argument("--pull-all-apks", required=False,
                       action="count",
                       help="If specified, the script will attempt to download "
@@ -194,6 +202,46 @@ def adb_installed(logger: logging.Logger) -> bool:
 
   logger.debug("ADB was NOT found on system!")
   return False
+
+
+def select_target_devices(connected_devices: list,
+                          requested_serials: Optional[list[str]],
+                          logger: logging.Logger) -> tuple[list, list[str]]:
+  """Narrows connected devices down to the ones requested via --serial.
+
+  Args:
+    connected_devices: DeviceInfo-like objects as returned by
+                       AdbWrapper.devices().
+    requested_serials: Serial numbers passed via --serial, or None if the flag
+                       was not used. Duplicates are ignored.
+    logger: A logger object to log debug or error messages.
+
+  Returns:
+    A tuple (target_devices, missing_serials). When requested_serials is None,
+    target_devices is connected_devices unchanged and missing_serials is empty.
+    Otherwise target_devices holds the connected devices matching the request,
+    in the order the serials were requested, and missing_serials holds the
+    requested serials that are not connected, also in request order.
+  """
+  if requested_serials is None:
+    return list(connected_devices), []
+
+  by_serial = {d.serial_number: d for d in connected_devices}
+  target_devices = []
+  missing_serials = []
+  seen = set()
+  for serial in requested_serials:
+    if serial in seen:
+      logger.debug("Ignoring duplicate --serial %s", serial)
+      continue
+    seen.add(serial)
+    if serial in by_serial:
+      target_devices.append(by_serial[serial])
+    else:
+      logger.error("Requested device with serial number %s is not connected.",
+                   serial)
+      missing_serials.append(serial)
+  return target_devices, missing_serials
 
 
 def clear_logcat(adb_wrapper):
@@ -900,23 +948,27 @@ def main():
   if not AdbWrapper.start_server(logger):
     return
 
-  connected_devices = AdbWrapper.devices(logger)
-  if not connected_devices or len(connected_devices) < 1:
+  connected_devices = AdbWrapper.devices(logger) or []
+  # With --serial, fall through: every requested serial is then reported as
+  # missing, FAILED in the summary, and the run exits 1.
+  if not connected_devices and args.serial is None:
     logger.error("No devices connected!")
     return
 
   logger.debug("There are %d connected device(s)", len(connected_devices))
-  # Here we'll handle the cases where there can be 1 or more devices connected
-  if len(connected_devices) > 1:
-    # TODO(billylau): Branch off based on user-input - do all, or selectively
+  target_devices, missing_serials = select_target_devices(
+      connected_devices, args.serial, logger)
+  # Without --serial every connected device is observed; warn in case that
+  # was not intended. With --serial the user has already chosen explicitly.
+  if args.serial is None and len(connected_devices) > 1:
     logger.warning("More than 1 device connected!")
 
   results = {}
   prefetched = False
-  has_errors = False
+  has_errors = bool(missing_serials)
   verification_failed_devices = set()
   collection_error_devices = set()
-  for target_device in connected_devices:
+  for target_device in target_devices:
     try:
       if target_device.unauthorized:
         logger.error("Please authorize device with serial number %s for ADB via "
@@ -1023,8 +1075,18 @@ def main():
       if target_device.serial_number in results:
         collection_error_devices.add(target_device.serial_number)
 
-  for target_device in connected_devices:
-    device = target_device.serial_number
+  # Summarise in the order devices were requested (or discovered, without
+  # --serial), including requested serials that were never connected.
+  missing = set(missing_serials)
+  summary_serials = list(dict.fromkeys(
+      args.serial if args.serial is not None
+      else [d.serial_number for d in connected_devices]))
+  for device in summary_serials:
+    if device in missing:
+      logger.error(
+          "FAILED: Requested device %s is not connected (exiting 1).",
+          device)
+      continue
     if device not in results:
       logger.error(
           "FAILED: Hubble data collection failed on connected device %s "
