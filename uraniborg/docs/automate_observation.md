@@ -84,6 +84,8 @@ Optional fields are left out rather than set to `null`.
 | `step` | `step`, `state` (`started` / `finished` / `failed`), `device`\*, `duration_ms`\*\*, `message`\* | Around each phase (see below) |
 | `devices` | `devices` (list of `{serial, unauthorized, model?, product?, device?}`), `selected` (serials to observe), `missing` (requested via `--serial` but not connected) | Once, after listing devices |
 | `device_started` | `device` | Before processing each selected device |
+| `prompt` | `device`, `kind`, `message`, `expects_input` | The script is waiting for a person (see [Manual intervention](#manual-intervention)) |
+| `prompt_resolved` | `device`, `kind`, `outcome` | The wait is over, however it ended |
 | `device_finished` | `device`, `status`, `results_dir`\*, `error`\* | After each selected device, and once for each missing serial |
 | `run_finished` | `exit_code`, `ok`, `summary`, `error`\* | Last event of a run that ends normally, exits early, raises, or is stopped by Ctrl-C or `SIGTERM` (see [End of stream](#end-of-stream)) |
 
@@ -102,6 +104,30 @@ with `--perform_inclusion_proof_check`, `inclusion_proof_prefetch` (only when
 pre-fetching is attempted) and `inclusion_proof_check`. A failed
 `inclusion_proof_prefetch` is not fatal: verification falls back to fetching
 entries on demand.
+
+#### Manual intervention
+
+Two situations need a person. Each is reported as a `prompt` event, and is
+always followed by a matching `prompt_resolved` (same `device` and `kind`)
+once the wait ends, whether it succeeded, failed or was interrupted.
+
+| `kind` | When | `expects_input` | What to do |
+| :--- | :--- | :--- | :--- |
+| `xiaomi_manual_install` | During `install_hubble` on Xiaomi phones, where Hubble must be installed by hand | `true` | Install Hubble on the device, then write a newline to the script's stdin. If Hubble is still not installed, the script waits for another newline, without a new `prompt` |
+| `adb_backup_confirm` | During `extract_results`, when results must be pulled with `adb backup` | `false` | Tap `Back up my data` on the device. Nothing is read from stdin |
+
+`prompt_resolved.outcome` says how the wait ended:
+
+| `outcome` | Meaning |
+| :--- | :--- |
+| `done` | Hubble is installed, or `adb backup` completed |
+| `failed` | `adb backup` failed (the device then fails with `extract_failed`) |
+| `stdin_closed` | stdin was closed while waiting for a newline |
+| `interrupted` / `terminated` / `unexpected_error` | The wait was cut short by Ctrl-C, `SIGTERM` or an unhandled exception |
+
+If stdin is closed while the script waits for a newline (for example, the
+wrapper exits, or stdin is `/dev/null`), that device fails with reason
+`stdin_closed` and the run moves on to the next device.
 
 **Device status.** `device_finished.status` and `summary[serial].status` use the
 same four outcomes as the final log summary:
@@ -162,6 +188,7 @@ with code `0`, but `run_finished.error` explains why.
 | `launch_failed` | Hubble could not be launched | `failed` |
 | `no_results` | Hubble produced no results in time | `failed` |
 | `extract_failed` | Results could not be pulled from the device | `failed` |
+| `stdin_closed` | stdin was closed while waiting for a manual Hubble install | `failed` |
 | `inclusion_proof_check_incomplete` | The inclusion proof check could not complete | `partial_check_incomplete` |
 | `unexpected_error` | An unhandled exception while processing the device | `failed` or `partial_error` |
 | `interrupted` | Ctrl-C while processing the device | `failed` or `partial_error` |
