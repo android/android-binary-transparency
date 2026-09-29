@@ -2000,5 +2000,143 @@ def test_main_logs_no_argument_warnings_by_default(
   m["logger"].warning.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "collected, collection_error, check_incomplete, expected",
+    [
+        (False, False, False, "failed"),
+        (False, True, True, "failed"),
+        (True, True, False, "partial_error"),
+        (True, True, True, "partial_error"),
+        (True, False, True, "partial_check_incomplete"),
+        (True, False, False, "success"),
+    ],
+)
+def test_classify_device(collected, collection_error, check_incomplete,
+                         expected):
+  assert automate_observation.classify_device(
+      collected, collection_error, check_incomplete) == expected
+
+
+def _process(monkeypatch, device, *extra, state=None):
+  _set_argv(monkeypatch, *extra)
+  args = automate_observation.parse_arguments()
+  return automate_observation.process_device(
+      device, args, mock.Mock(), automate_observation.EventEmitter(),
+      state if state is not None else automate_observation.RunState())
+
+
+def test_process_device_success(serial_main_mocks, monkeypatch):
+  result = _process(monkeypatch, _make_mock_device("DEV1"))
+  assert result == automate_observation.DeviceResult(
+      status="success", results_dir="/tmp/out/DEV1")
+  assert serial_main_mocks["processed"] == ["DEV1"]
+
+
+def test_process_device_unauthorized_touches_nothing(
+    serial_main_mocks, monkeypatch,
+):
+  device = _make_mock_device("DEV1")
+  device.unauthorized = True
+  result = _process(monkeypatch, device)
+  assert result.status == "failed"
+  assert result.results_dir is None
+  assert result.error["reason"] == "unauthorized"
+  serial_main_mocks["AdbWrapper"].assert_not_called()
+
+
+def test_process_device_error_after_collection_is_partial(
+    serial_main_mocks, monkeypatch,
+):
+  with mock.patch("automate_observation.os.path.isfile", return_value=True), \
+       mock.patch("inclusion_proof_check.prefetch_log_entries",
+                  return_value=True), \
+       mock.patch("inclusion_proof_check.perform_inclusion_proof_check",
+                  side_effect=RuntimeError("boom")):
+    result = _process(monkeypatch, _make_mock_device("DEV1"),
+                      "--perform_inclusion_proof_check", "--verifier_path=/v")
+  assert result == automate_observation.DeviceResult(
+      status="partial_error", results_dir="/tmp/out/DEV1",
+      error={"reason": "unexpected_error", "message": "RuntimeError: boom"})
+
+
+def test_process_device_run_state_prefetches_once(
+    serial_main_mocks, monkeypatch,
+):
+  state = automate_observation.RunState()
+  with mock.patch("automate_observation.os.path.isfile", return_value=True), \
+       mock.patch("inclusion_proof_check.prefetch_log_entries",
+                  return_value=True) as prefetch, \
+       mock.patch("inclusion_proof_check.perform_inclusion_proof_check",
+                  return_value=True):
+    for serial in ("DEV1", "DEV2"):
+      result = _process(monkeypatch, _make_mock_device(serial),
+                        "--perform_inclusion_proof_check", "--verifier_path=/v",
+                        state=state)
+      assert result.status == "success"
+  prefetch.assert_called_once()
+  assert state.prefetched is True
+
+
+def test_print_summary_logs_each_outcome_in_order():
+  DeviceResult = automate_observation.DeviceResult
+  outcomes = {
+      "OK": DeviceResult("success", "/r/OK"),
+      "GONE": DeviceResult("failed", error={"reason": "not_connected",
+                                            "message": "x"}),
+      "BAD": DeviceResult("failed"),
+      "ERR": DeviceResult("partial_error", "/r/ERR"),
+      "CHK": DeviceResult("partial_check_incomplete", "/r/CHK"),
+  }
+  logger = mock.Mock()
+  manager = mock.Mock()
+  manager.attach_mock(logger.info, "info")
+  manager.attach_mock(logger.warning, "warning")
+  manager.attach_mock(logger.error, "error")
+
+  summary = automate_observation.print_summary(
+      ["OK", "GONE", "BAD", "ERR", "CHK"], outcomes, ["GONE"], logger)
+
+  assert summary == {
+      "OK": {"status": "success", "results_dir": "/r/OK"},
+      "GONE": {"status": "failed"},
+      "BAD": {"status": "failed"},
+      "ERR": {"status": "partial_error", "results_dir": "/r/ERR"},
+      "CHK": {"status": "partial_check_incomplete", "results_dir": "/r/CHK"},
+  }
+  assert list(summary) == ["OK", "GONE", "BAD", "ERR", "CHK"]
+  calls = [(c[0], c[1][0].split(":")[0], c[1][1:]) for c in manager.mock_calls]
+  assert calls == [
+      ("info", "SUCCESS! Hubble was successfully deployed and executed on "
+       "connected device %s.", ("OK",)),
+      ("info", "Hubble output files can be found at", ("/r/OK",)),
+      ("error", "FAILED", ("GONE",)),
+      ("error", "FAILED", ("BAD",)),
+      ("warning", "PARTIAL SUCCESS", ("ERR",)),
+      ("info", "Hubble output files can be found at", ("/r/ERR",)),
+      ("warning", "PARTIAL SUCCESS", ("CHK",)),
+      ("info", "Hubble output files can be found at", ("/r/CHK",)),
+  ]
+  assert "not connected" in manager.mock_calls[2][1][0]
+  assert "unexpected error" in manager.mock_calls[4][1][0]
+  assert "inclusion proof" in manager.mock_calls[6][1][0]
+
+
+def test_main_duplicate_serial_failure_is_not_hidden_by_later_success(
+    serial_main_mocks, monkeypatch: pytest.MonkeyPatch,
+):
+  """Some devices share a serial; one failing must still make the run fail."""
+  m = serial_main_mocks
+  m["AdbWrapper"].devices.return_value = [_make_mock_device("DUP"),
+                                          _make_mock_device("DUP")]
+  m["install_hubble"].side_effect = [False, True]
+  _set_argv(monkeypatch)
+
+  with pytest.raises(SystemExit) as exc_info:
+    automate_observation.main()
+
+  assert exc_info.value.code == 1
+  assert m["processed"] == ["DUP", "DUP"]
+
+
 if __name__ == "__main__":
   sys.exit(pytest.main([__file__]))
