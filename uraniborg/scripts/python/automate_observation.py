@@ -206,10 +206,22 @@ REASON_LAUNCH_FAILED = "launch_failed"
 REASON_NO_RESULTS = "no_results"
 REASON_EXTRACT_FAILED = "extract_failed"
 REASON_INCLUSION_PROOF_CHECK_INCOMPLETE = "inclusion_proof_check_incomplete"
+REASON_STDIN_CLOSED = "stdin_closed"
 # Both run_finished.error and device_finished.error:
 REASON_UNEXPECTED_ERROR = "unexpected_error"
 REASON_INTERRUPTED = "interrupted"
 REASON_TERMINATED = "terminated"
+
+# Kinds of manual intervention reported by prompt / prompt_resolved events.
+PROMPT_XIAOMI_MANUAL_INSTALL = "xiaomi_manual_install"
+PROMPT_ADB_BACKUP_CONFIRM = "adb_backup_confirm"
+
+# How a prompt ended, reported by prompt_resolved.outcome. An exception during
+# the wait maps to REASON_INTERRUPTED, REASON_TERMINATED or
+# REASON_UNEXPECTED_ERROR.
+PROMPT_OUTCOME_DONE = "done"
+PROMPT_OUTCOME_FAILED = "failed"
+PROMPT_OUTCOME_STDIN_CLOSED = REASON_STDIN_CLOSED
 
 
 class Terminated(BaseException):
@@ -278,6 +290,13 @@ class _Step:
     self.failed = True
     self.message = message
     return message
+
+
+class _Prompt:
+  """Handle yielded by EventEmitter.prompt() to record how the wait ended."""
+
+  def __init__(self):
+    self.outcome = PROMPT_OUTCOME_DONE
 
 
 class EventEmitter:
@@ -356,6 +375,30 @@ class EventEmitter:
               device=device,
               duration_ms=int((time.monotonic() - start) * 1000),
               message=handle.message)
+
+  @contextlib.contextmanager
+  def prompt(self, device: Optional[str], kind: str, message: str,
+             expects_input: bool):
+    """Brackets a wait for manual intervention with prompt/prompt_resolved.
+
+    prompt_resolved is emitted however the body exits, including by an
+    exception, so every prompt is closed. Its outcome is "done" unless the
+    body sets another PROMPT_OUTCOME_* on the yielded handle, or raises (then
+    it is the matching error reason, e.g. "interrupted"). expects_input tells
+    the reader whether the script is blocked on stdin (write a newline to
+    continue) or on an action on the device.
+    """
+    handle = _Prompt()
+    self.emit("prompt", device=device, kind=kind, message=message,
+              expects_input=expects_input)
+    try:
+      yield handle
+    except BaseException as e:
+      handle.outcome = _interruption_error(e)["reason"]
+      raise
+    finally:
+      self.emit("prompt_resolved", device=device, kind=kind,
+                outcome=handle.outcome)
 
   def finish_run(self, exit_code: int, summary: Optional[dict] = None,
                  error: Optional[dict] = None):
@@ -575,6 +618,48 @@ def launch_xiaomi_file_explorer(
   return adb_wrapper.am_start(
       "com.mi.android.globalFileexplorer",
       "com.android.fileexplorer.FileExplorerTabActivity")
+
+
+def wait_for_xiaomi_manual_install(adb_wrapper: syscall_wrapper.AdbWrapper,
+                                   serial: str,
+                                   logger: logging.Logger,
+                                   events: EventEmitter) -> bool:
+  """Waits, via stdin, for the user to install Hubble by hand on a Xiaomi phone.
+
+  The user is asked to press Enter after installing; this repeats until Hubble
+  is installed. With --events, the wait is reported as a prompt event so that
+  a parent process can ask its user and then write a newline to stdin.
+
+  Args:
+    adb_wrapper: An AdbWrapper for the target device.
+    serial: The target device's serial number, for events.
+    logger: A logger object to log messages.
+    events: The EventEmitter for the run.
+
+  Returns:
+    True once Hubble is installed; False if stdin was closed first (e.g. the
+    parent process cancelled the run, or stdin is /dev/null).
+  """
+  if is_hubble_installed(adb_wrapper, logger):
+    return True
+  with events.prompt(serial, PROMPT_XIAOMI_MANUAL_INSTALL,
+                     "Install Hubble manually from the \"Downloads\" folder "
+                     "in the \"Files Manager\" app on the device, then press "
+                     "Enter.",
+                     expects_input=True) as prompt:
+    while True:
+      logger.warning("Please manually install Hubble by launching the "
+                     "\"Files Manager\" app (it may have been launched "
+                     "for you) and navigate to the \"Downloads\" folder.")
+      try:
+        input("Press [ENTER] when you are done.")
+      except EOFError:
+        logger.error("Standard input was closed while waiting for Hubble to "
+                     "be installed manually on device %s.", serial)
+        prompt.outcome = PROMPT_OUTCOME_STDIN_CLOSED
+        return False
+      if is_hubble_installed(adb_wrapper, logger):
+        return True
 
 
 def adb_push_hubble(adb_wrapper: syscall_wrapper.AdbWrapper,
@@ -850,7 +935,8 @@ def classify_dir_using_build_fingerprint(
     extract_apks: bool,
     logger: logging.Logger,
     pull_preinstalled_only: bool = False,
-    tmp_dir: str = "/tmp") -> Optional[str]:
+    tmp_dir: str = "/tmp",
+    events: Optional[EventEmitter] = None) -> Optional[str]:
   """Decides which directory in results/ to dump new result to.
 
   This is a renewed method that makes use of build fingerprint to do
@@ -868,6 +954,8 @@ def classify_dir_using_build_fingerprint(
                             listed in preinstalled_packages.txt.
     tmp_dir: Temporary directory on host used for staging build.txt and
              adb backup artifacts. Defaults to "/tmp".
+    events: An optional EventEmitter; used to report the `adb backup`
+            confirmation that the user must give on the device.
 
   Returns:
     A string representing the final directory (on host) where results are pulled
@@ -888,7 +976,15 @@ def classify_dir_using_build_fingerprint(
     decompressed_backup_filepath = os.path.join(tmp_dir, "hubble_results.tar")
     logger.warning("Manual intervention required: Please select "
                    "`Back up my data` to proceed")
-    if not adb_wrapper.backup(compressed_backup_filepath, HUBBLE_PACKAGE_NAME):
+    with (events or EventEmitter()).prompt(
+        adb_wrapper.device_serial_number, PROMPT_ADB_BACKUP_CONFIRM,
+        "Select `Back up my data` on the device to proceed.",
+        expects_input=False) as prompt:
+      backed_up = adb_wrapper.backup(compressed_backup_filepath,
+                                     HUBBLE_PACKAGE_NAME)
+      if not backed_up:
+        prompt.outcome = PROMPT_OUTCOME_FAILED
+    if not backed_up:
       logger.error("Failed to use `adb backup` to pull result files.")
       return None
 
@@ -994,7 +1090,9 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
                              logger: logging.Logger,
                              extract_apks=False,
                              pull_preinstalled_only=False,
-                             tmp_dir: str = "/tmp") -> Optional[str]:
+                             tmp_dir: str = "/tmp",
+                             events: Optional[EventEmitter] = None
+                             ) -> Optional[str]:
   """Extracts results (and optionally APKs) from Hubble's execution.
 
   Args:
@@ -1008,6 +1106,7 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
                             from preinstalled_packages.txt.
     tmp_dir: Temporary directory on host used for staging build.txt and
              adb backup artifacts. Defaults to "/tmp".
+    events: An optional EventEmitter, passed on to report manual intervention.
 
   Returns:
     A string representing the final directory (on host) where results are copied
@@ -1041,7 +1140,8 @@ def extract_results_and_apks(adb_wrapper: syscall_wrapper.AdbWrapper,
                                               extract_apks,
                                               logger,
                                               pull_preinstalled_only=pull_preinstalled_only,
-                                              tmp_dir=tmp_dir)
+                                              tmp_dir=tmp_dir,
+                                              events=events)
 
 
 def extract_selinux_policies(adb_wrapper: syscall_wrapper.AdbWrapper,
@@ -1327,11 +1427,13 @@ def run(args: argparse.Namespace, logger: logging.Logger,
           adb_push_hubble(adb_wrapper, args.hubble)
           if not launch_xiaomi_file_explorer(adb_wrapper):
             logger.error("Failed to launch Xiaomi file explorer")
-          while not is_hubble_installed(adb_wrapper, logger):
-            logger.warning("Please manually install Hubble by launching the "
-                           "\"Files Manager\" app (it may have been launched "
-                           "for you) and navigate to the \"Downloads\" folder.")
-            input("Press [ENTER] when you are done.")
+          if not wait_for_xiaomi_manual_install(adb_wrapper, serial, logger,
+                                                events):
+            device_error = _error(REASON_STDIN_CLOSED, s.fail(
+                "Standard input closed while waiting for manual Hubble "
+                "installation."))
+            has_errors = True
+            continue
         else:
           logger.info("This is not a Xiaomi phone. Regular workflow continues...")
           if not install_hubble(adb_wrapper, args, logger):
@@ -1370,7 +1472,8 @@ def run(args: argparse.Namespace, logger: logging.Logger,
               logger,
               extract_apks,
               pull_preinstalled_only=args.pull_preinstalled_apks_only,
-              tmp_dir=device_tmp_dir)
+              tmp_dir=device_tmp_dir,
+              events=events)
 
         if not results_dir:
           logger.error("Failed to extract results from target device (%s).",

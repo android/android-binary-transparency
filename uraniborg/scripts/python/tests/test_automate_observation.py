@@ -1321,6 +1321,7 @@ def test_extract_results_and_apks_destination_normalization_and_validation(
       logger,
       pull_preinstalled_only=True,
       tmp_dir=staging_dir,
+      events=None,
   )
 
   # 2. Destination already ending with "results" + trailing slashes -> does not duplicate "/results"
@@ -1342,6 +1343,7 @@ def test_extract_results_and_apks_destination_normalization_and_validation(
       logger,
       pull_preinstalled_only=False,
       tmp_dir="/tmp",
+      events=None,
   )
 
   # 3. Empty destination "" -> defaults to <cwd>/results
@@ -1365,6 +1367,7 @@ def test_extract_results_and_apks_destination_normalization_and_validation(
       logger,
       pull_preinstalled_only=False,
       tmp_dir="/tmp",
+      events=None,
   )
 
   # 4. Target results_dir exists as a regular file -> logs error and returns None

@@ -875,5 +875,204 @@ def test_open_event_stream_dash_moves_other_stdout_writes_to_stderr():
   assert "noise from child" in proc.stderr
 
 
+# --- Manual-intervention prompts ------------------------------------------------
+
+
+def test_prompt_is_always_followed_by_prompt_resolved():
+  stream = io.StringIO()
+  emitter = _emitter(stream)
+  with emitter.prompt("DEV1", "some_kind", "Do something.",
+                      expects_input=True):
+    pass
+  with pytest.raises(KeyboardInterrupt):
+    with emitter.prompt(None, "other_kind", "Wait.", expects_input=False):
+      raise KeyboardInterrupt()
+  assert _parse(stream) == [
+      {"v": 1, "ts": "2026-01-02T03:04:05.678Z", "type": "prompt",
+       "device": "DEV1", "kind": "some_kind", "message": "Do something.",
+       "expects_input": True},
+      {"v": 1, "ts": "2026-01-02T03:04:05.678Z", "type": "prompt_resolved",
+       "device": "DEV1", "kind": "some_kind", "outcome": "done"},
+      {"v": 1, "ts": "2026-01-02T03:04:05.678Z", "type": "prompt",
+       "kind": "other_kind", "message": "Wait.", "expects_input": False},
+      {"v": 1, "ts": "2026-01-02T03:04:05.678Z", "type": "prompt_resolved",
+       "kind": "other_kind", "outcome": "interrupted"},
+  ]
+
+
+@pytest.mark.parametrize(
+    "body, expected_outcome",
+    [
+        (lambda p: None, "done"),
+        (lambda p: setattr(p, "outcome", "failed"), "failed"),
+        (lambda p: setattr(p, "outcome", "stdin_closed"), "stdin_closed"),
+    ],
+    ids=["default", "failed", "stdin_closed"],
+)
+def test_prompt_outcome_set_by_body(body, expected_outcome):
+  stream = io.StringIO()
+  with _emitter(stream).prompt("DEV1", "k", "m", expects_input=True) as p:
+    body(p)
+  assert _parse(stream)[-1]["outcome"] == expected_outcome
+
+
+@pytest.mark.parametrize(
+    "exc, expected_outcome",
+    [
+        (KeyboardInterrupt(), "interrupted"),
+        (automate_observation.Terminated(), "terminated"),
+        (RuntimeError("boom"), "unexpected_error"),
+    ],
+    ids=["ctrl_c", "sigterm", "exception"],
+)
+def test_prompt_outcome_from_exception_overrides_body(exc, expected_outcome):
+  stream = io.StringIO()
+  with pytest.raises(type(exc)):
+    with _emitter(stream).prompt("DEV1", "k", "m", expects_input=True) as p:
+      p.outcome = "failed"
+      raise exc
+  assert _parse(stream)[-1] == {
+      "v": 1, "ts": "2026-01-02T03:04:05.678Z", "type": "prompt_resolved",
+      "device": "DEV1", "kind": "k", "outcome": expected_outcome}
+
+
+def test_prompt_without_stream_is_a_noop():
+  with EventEmitter().prompt("DEV1", "k", "m", expects_input=True):
+    pass
+
+
+@pytest.fixture
+def xiaomi_mocks(serial_main_mocks):
+  m = serial_main_mocks
+  m["AdbWrapper"].devices.return_value = [_make_mock_device("DEV1")]
+  m["is_xiaomi_phone"].return_value = True
+  with mock.patch("automate_observation.adb_push_hubble"), \
+       mock.patch("automate_observation.launch_xiaomi_file_explorer",
+                  return_value=True):
+    yield m
+
+
+def test_main_events_xiaomi_manual_install_prompt(
+    xiaomi_mocks, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+  m = xiaomi_mocks
+  # Not installed beforehand; then still missing after the first Enter, and
+  # installed after the second.
+  m["is_hubble_installed"].side_effect = [False, False, False, True]
+  stdin = io.StringIO("\n\n")
+  monkeypatch.setattr(sys, "stdin", stdin)
+  events_path = tmp_path / "events.jsonl"
+  _set_argv(monkeypatch, "--events", str(events_path))
+  extract = m["extract_results_and_apks"].side_effect
+  emitter_enabled_at_extract = []
+
+  def _extract(*args, **kwargs):
+    emitter_enabled_at_extract.append(kwargs["events"].enabled)
+    return extract(*args, **kwargs)
+
+  m["extract_results_and_apks"].side_effect = _extract
+
+  automate_observation.main()
+
+  assert stdin.read() == ""  # both newlines consumed by the real input()
+  events = _read_events(events_path)
+  install = [e for e in events if e["type"] in ("prompt", "prompt_resolved")
+             or (e["type"] == "step" and e["step"] == "install_hubble")]
+  assert [(e["type"], e.get("state")) for e in install] == [
+      ("step", "started"), ("prompt", None), ("prompt_resolved", None),
+      ("step", "finished")]
+  prompt = install[1]
+  assert prompt["device"] == "DEV1"
+  assert prompt["kind"] == "xiaomi_manual_install"
+  assert prompt["expects_input"] is True
+  assert "press Enter" in prompt["message"]
+  assert (install[2]["device"], install[2]["kind"], install[2]["outcome"]) == (
+      "DEV1", "xiaomi_manual_install", "done")
+  (finished,) = _of_type(events, "device_finished")
+  assert finished["status"] == "success"
+  # The live emitter is also handed down for the adb backup prompt.
+  assert emitter_enabled_at_extract == [True]
+
+
+def test_main_events_xiaomi_already_installed_after_push_has_no_prompt(
+    xiaomi_mocks, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+  m = xiaomi_mocks
+  m["is_hubble_installed"].side_effect = [False, True]
+  events_path = tmp_path / "events.jsonl"
+  _set_argv(monkeypatch, "--events", str(events_path))
+  with mock.patch("builtins.input") as fake_input:
+    automate_observation.main()
+  fake_input.assert_not_called()
+  assert not _of_type(_read_events(events_path), "prompt")
+
+
+@pytest.mark.parametrize("with_events", [True, False])
+def test_main_xiaomi_stdin_closed_fails_device_and_stops_waiting(
+    xiaomi_mocks, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    with_events,
+):
+  m = xiaomi_mocks
+  m["is_hubble_installed"].return_value = False  # never installed
+  monkeypatch.setattr(sys, "stdin", io.StringIO(""))  # EOF on first read
+  events_path = tmp_path / "events.jsonl"
+  _set_argv(monkeypatch,
+            *(["--events", str(events_path)] if with_events else []))
+
+  with pytest.raises(SystemExit) as exc_info:
+    automate_observation.main()
+
+  assert exc_info.value.code == 1
+  m["launch_hubble"].assert_not_called()
+  # Reported as a clear error, not as an unexpected exception.
+  m["logger"].exception.assert_not_called()
+  assert any("Standard input was closed" in c.args[0]
+             for c in m["logger"].error.call_args_list)
+  if not with_events:
+    assert not events_path.exists()
+    return
+  events = _read_events(events_path)
+  assert [(e["type"], e.get("outcome")) for e in events
+          if e["type"] in ("prompt", "prompt_resolved")] == [
+              ("prompt", None), ("prompt_resolved", "stdin_closed")]
+  assert _steps(events, "DEV1") == [
+      ("install_hubble", "started"), ("install_hubble", "failed")]
+  (finished,) = _of_type(events, "device_finished")
+  assert finished["status"] == "failed"
+  assert finished["error"]["reason"] == "stdin_closed"
+  assert events[-1]["summary"] == {"DEV1": {"status": "failed"}}
+
+
+def test_adb_backup_confirmation_is_reported_as_prompt(tmp_path: Path):
+  stream = io.StringIO()
+  emitter = _emitter(stream)
+  mock_adb = mock.Mock()
+  mock_adb.device_serial_number = "DEV1"
+  mock_adb.pull.return_value = False  # forces the adb backup fallback
+  events_during_backup = []
+
+  def fake_backup(ab_path, pkg_name):  # pylint: disable=unused-argument
+    events_during_backup.extend(_parse(stream))
+    return False
+
+  mock_adb.backup.side_effect = fake_backup
+
+  assert automate_observation.classify_dir_using_build_fingerprint(
+      mock_adb, "/sdcard/hubble/results", str(tmp_path / "results"),
+      extract_apks=False, logger=mock.Mock(), tmp_dir=str(tmp_path),
+      events=emitter) is None
+
+  # The prompt is open while `adb backup` blocks, and closed afterwards even
+  # though the backup failed.
+  assert [e["type"] for e in events_during_backup] == ["prompt"]
+  assert events_during_backup[0]["device"] == "DEV1"
+  assert events_during_backup[0]["kind"] == "adb_backup_confirm"
+  assert events_during_backup[0]["expects_input"] is False
+  assert [(e["type"], e["kind"], e.get("outcome"))
+          for e in _parse(stream)] == [
+              ("prompt", "adb_backup_confirm", None),
+              ("prompt_resolved", "adb_backup_confirm", "failed")]
+
+
 if __name__ == "__main__":
   sys.exit(pytest.main([__file__]))
