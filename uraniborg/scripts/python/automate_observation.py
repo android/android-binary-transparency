@@ -22,6 +22,7 @@ Hubble data back to host.
 """
 import argparse
 import contextlib
+import dataclasses
 import datetime
 import io   # to convert regular buffer to in-memory bytes buffer for tarfileobj
 import json
@@ -492,16 +493,47 @@ def _device_to_event(device) -> dict:
   return info
 
 
-def device_status(serial: str, results: dict, missing_serials,
-                  collection_error_devices, verification_failed_devices) -> str:
-  """Classifies a device's outcome into one of the STATUS_* values."""
-  if serial in missing_serials or serial not in results:
+def classify_device(collected: bool, collection_error: bool,
+                    check_incomplete: bool) -> str:
+  """Maps what happened on one device to one of the STATUS_* values."""
+  if not collected:
     return STATUS_FAILED
-  if serial in collection_error_devices:
+  if collection_error:
     return STATUS_PARTIAL_ERROR
-  if serial in verification_failed_devices:
+  if check_incomplete:
     return STATUS_PARTIAL_CHECK_INCOMPLETE
   return STATUS_SUCCESS
+
+
+@dataclasses.dataclass
+class DeviceResult:
+  """The outcome of observing one device, as reported by device_finished."""
+  status: str
+  results_dir: Optional[str] = None
+  error: Optional[dict] = None
+
+
+@dataclasses.dataclass
+class RunState:
+  """State carried from one device to the next within a run."""
+  # Log entries only need pre-fetching once per run.
+  prefetched: bool = False
+
+
+@dataclasses.dataclass
+class _DeviceProgress:
+  """What process_device() has learned about one device so far."""
+  results_dir: Optional[str] = None  # set once results are fully collected
+  error: Optional[dict] = None
+  collection_error: bool = False
+  check_incomplete: bool = False
+
+  def result(self) -> DeviceResult:
+    return DeviceResult(
+        status=classify_device(self.results_dir is not None,
+                               self.collection_error, self.check_incomplete),
+        results_dir=self.results_dir,
+        error=self.error)
 
 
 def supported_platform(logger: logging.Logger) -> bool:
@@ -1353,6 +1385,241 @@ def rebuild_hubble(logger: logging.Logger) -> tuple[Optional[str], Optional[dict
   return latest_symlink_path, None
 
 
+def process_device(target_device, args: argparse.Namespace,
+                   logger: logging.Logger, events: EventEmitter,
+                   state: RunState) -> DeviceResult:
+  """Observes one selected device, from installing Hubble to the proof check.
+
+  Emits device_started and, however processing ends, device_finished.
+  Exceptions are logged and reported as the device's error; KeyboardInterrupt
+  and other BaseExceptions are reported, then re-raised.
+
+  Args:
+    target_device: A DeviceInfo from AdbWrapper.devices().
+    args: Parsed arguments from parse_arguments().
+    logger: A logger object to log debug or error messages.
+    events: Where to report progress events. May be a disabled emitter.
+    state: State shared with the other devices of this run.
+
+  Returns:
+    The device's outcome.
+  """
+  serial = target_device.serial_number
+  progress = _DeviceProgress()
+  events.emit("device_started", device=serial)
+  try:
+    _observe_device(target_device, args, logger, events, state, progress)
+  except Exception as e:
+    logger.exception("Unexpected error while processing device %s: %s",
+                     serial, e)
+    progress.error = _error(REASON_UNEXPECTED_ERROR,
+                            "{}: {}".format(type(e).__name__, e))
+    progress.collection_error = True
+  except BaseException as e:
+    # KeyboardInterrupt and other non-Exception exits bypass the handler
+    # above. Record them before propagating, so the device_finished event
+    # in the finally block does not report an interrupted device as a
+    # success when its results were already collected.
+    progress.error = _interruption_error(e)
+    progress.collection_error = True
+    raise
+  finally:
+    result = progress.result()
+    events.device_finished(serial, result.status,
+                           results_dir=result.results_dir,
+                           error=result.error)
+  return result
+
+
+def _observe_device(target_device, args: argparse.Namespace,
+                    logger: logging.Logger, events: EventEmitter,
+                    state: RunState, progress: _DeviceProgress):
+  """The steps of process_device(); returns early when a step fails.
+
+  Failures are recorded on progress rather than returned, so that
+  process_device() can report them even when an exception cuts this short.
+  """
+  serial = target_device.serial_number
+  if target_device.unauthorized:
+    logger.error("Please authorize device with serial number %s for ADB via "
+                 "device GUI.", serial)
+    progress.error = _error(REASON_UNAUTHORIZED,
+                            "ADB is not authorized on this device.")
+    return
+
+  # set up an adb_wrapper to be used throughout for this target device
+  adb_wrapper = AdbWrapper(serial, logger)
+
+  if is_hubble_installed(adb_wrapper, logger):
+    logger.debug("Removing previous Hubble installation...")
+    with events.step("uninstall_previous", serial) as s:
+      if not remove_previous_installation(adb_wrapper):
+        logger.error("Failed to remove previous Hubble installation.")
+        progress.error = _error(REASON_UNINSTALL_FAILED, s.fail(
+            "Failed to remove previous Hubble installation."))
+        return
+
+  with events.step("install_hubble", serial) as s:
+    if is_xiaomi_phone(adb_wrapper, logger):
+      logger.info("This is a Xiaomi phone.")
+      adb_push_hubble(adb_wrapper, args.hubble)
+      if not launch_xiaomi_file_explorer(adb_wrapper):
+        logger.error("Failed to launch Xiaomi file explorer")
+      if not wait_for_xiaomi_manual_install(adb_wrapper, serial, logger,
+                                            events):
+        progress.error = _error(REASON_STDIN_CLOSED, s.fail(
+            "Standard input closed while waiting for manual Hubble "
+            "installation."))
+        return
+    else:
+      logger.info("This is not a Xiaomi phone. Regular workflow continues...")
+      if not install_hubble(adb_wrapper, args, logger):
+        logger.error("Error installing Hubble: %s", adb_wrapper.error_message)
+        progress.error = _error(REASON_INSTALL_FAILED, s.fail(
+            "Error installing Hubble: {}".format(adb_wrapper.error_message)))
+        return
+
+  with events.step("launch_hubble", serial) as s:
+    clear_logcat(adb_wrapper)
+    if not launch_hubble(adb_wrapper):
+      logger.error("Failed to launch Hubble: %s", adb_wrapper.error_message)
+      progress.error = _error(REASON_LAUNCH_FAILED, s.fail(
+          "Failed to launch Hubble: {}".format(adb_wrapper.error_message)))
+      return
+
+  with events.step("wait_for_results", serial) as s:
+    results_source = wait_for_results(adb_wrapper, logger)
+    if not results_source:
+      logger.error("Failed to obtain results from Hubble execution.")
+      progress.error = _error(REASON_NO_RESULTS, s.fail(
+          "Failed to obtain results from Hubble execution."))
+      return
+
+  with events.step("extract_results", serial) as s:
+    extract_apks = (args.pull_all_apks is not None) or args.pull_preinstalled_apks_only
+    with tempfile.TemporaryDirectory() as device_tmp_dir:
+      results_dir = extract_results_and_apks(
+          adb_wrapper,
+          results_source,
+          args.output,
+          logger,
+          extract_apks,
+          pull_preinstalled_only=args.pull_preinstalled_apks_only,
+          tmp_dir=device_tmp_dir,
+          events=events)
+
+    if not results_dir:
+      logger.error("Failed to extract results from target device (%s).",
+                   serial)
+      progress.error = _error(REASON_EXTRACT_FAILED, s.fail(
+          "Failed to extract results from device."))
+      return
+
+  with events.step("extract_selinux", serial):
+    extract_selinux_policies(adb_wrapper, results_dir, logger)
+  progress.results_dir = results_dir
+
+  if not args.perform_inclusion_proof_check:
+    return
+  pkg_filename = (
+      "preinstalled_packages.txt"
+      if args.check_preinstalled_only
+      else "packages.txt"
+  )
+  packages_txt_path = os.path.join(results_dir, "results", pkg_filename)
+  if args.check_preinstalled_only and not os.path.isfile(packages_txt_path):
+    with events.step("inclusion_proof_check", serial) as s:
+      logger.error(
+          "preinstalled_packages.txt not found at %s (extracted results at %s). "
+          "--check_preinstalled_only requires Hubble >= 2.1.0.",
+          packages_txt_path, results_dir)
+      progress.error = _error(
+          REASON_INCLUSION_PROOF_CHECK_INCOMPLETE,
+          s.fail("preinstalled_packages.txt not found; "
+                 "--check_preinstalled_only requires Hubble >= 2.1.0."))
+    progress.check_incomplete = True
+    return
+  if (not args.no_prefetch and not state.prefetched and
+      os.path.isfile(packages_txt_path)):
+    with events.step("inclusion_proof_prefetch", serial) as s:
+      state.prefetched = inclusion_proof_check.prefetch_log_entries(
+          args.verifier_path,
+          logger,
+          cache_dir=args.cache_dir,
+          concurrency=args.cache_prefetch_concurrency,
+          timeout=args.cache_prefetch_timeout)
+      if not state.prefetched:
+        s.fail("Pre-fetching failed; falling back to on-demand fetching.")
+  with events.step("inclusion_proof_check", serial) as s:
+    if not inclusion_proof_check.perform_inclusion_proof_check(
+        args.verifier_path,
+        packages_txt_path,
+        logger,
+        cache_dir=args.cache_dir,
+        concurrency=args.cache_prefetch_concurrency,
+        timeout=args.cache_prefetch_timeout,
+        prefetch=False,
+        preinstalled_only=args.check_preinstalled_only):
+      progress.check_incomplete = True
+      # False means the check could not complete (bad input or unwritable
+      # output), not that some splits are absent from the log; per-split
+      # results are in the *_signal.txt output.
+      progress.error = _error(REASON_INCLUSION_PROOF_CHECK_INCOMPLETE,
+                              s.fail("Inclusion proof check could not "
+                                     "complete."))
+
+
+def print_summary(serials, outcomes: dict, missing_serials,
+                  logger: logging.Logger) -> dict:
+  """Logs the final outcome line(s) for each device.
+
+  Args:
+    serials: Serials in the order to report them.
+    outcomes: serial -> DeviceResult, for every serial in serials.
+    missing_serials: Serials requested via --serial that were not connected.
+    logger: A logger object to log messages.
+
+  Returns:
+    The run_finished summary: serial -> {status, results_dir?}.
+  """
+  missing = set(missing_serials)
+  summary = {}
+  for device in serials:
+    outcome = outcomes[device]
+    status = outcome.status
+    summary[device] = {"status": status}
+    if outcome.results_dir is not None:
+      summary[device]["results_dir"] = outcome.results_dir
+
+    if device in missing:
+      logger.error(
+          "FAILED: Requested device %s is not connected (exiting 1).",
+          device)
+      continue
+    if status == STATUS_FAILED:
+      logger.error(
+          "FAILED: Hubble data collection failed on connected device %s "
+          "(exiting 1).",
+          device)
+      continue
+    if status == STATUS_PARTIAL_ERROR:
+      logger.warning(
+          "PARTIAL SUCCESS: Hubble data collection succeeded on connected "
+          "device %s, but an unexpected error occurred during post-collection "
+          "processing (exiting 1).",
+          device)
+    elif status == STATUS_PARTIAL_CHECK_INCOMPLETE:
+      logger.warning(
+          "PARTIAL SUCCESS: Hubble data collection succeeded on connected "
+          "device %s, but inclusion proof verification failed (exiting 1).",
+          device)
+    else:
+      logger.info("SUCCESS! Hubble was successfully deployed and executed on "
+                  "connected device %s.", device)
+    logger.info("Hubble output files can be found at: %s", outcome.results_dir)
+  return summary
+
+
 def run(args: argparse.Namespace, logger: logging.Logger,
         events: EventEmitter) -> int:
   """Runs the observation workflow.
@@ -1435,225 +1702,29 @@ def run(args: argparse.Namespace, logger: logging.Logger,
               devices=[_device_to_event(d) for d in connected_devices],
               selected=[d.serial_number for d in target_devices],
               missing=missing_serials)
+  outcomes = {}
   for serial in missing_serials:
+    outcomes[serial] = DeviceResult(
+        STATUS_FAILED, error=_error(REASON_NOT_CONNECTED,
+                                    "Requested device is not connected."))
     events.device_finished(serial, STATUS_FAILED,
-                           error=_error(REASON_NOT_CONNECTED,
-                                        "Requested device is not connected."))
+                           error=outcomes[serial].error)
 
-  results = {}
-  prefetched = False
+  state = RunState()
   has_errors = bool(missing_serials)
-  verification_failed_devices = set()
-  collection_error_devices = set()
   for target_device in target_devices:
-    serial = target_device.serial_number
-    device_error = None
-    events.emit("device_started", device=serial)
-    try:
-      if target_device.unauthorized:
-        logger.error("Please authorize device with serial number %s for ADB via "
-                     "device GUI.", serial)
-        device_error = _error(REASON_UNAUTHORIZED,
-                              "ADB is not authorized on this device.")
-        has_errors = True
-        continue
-
-      # set up an adb_wrapper to be used throughout for this target device
-      adb_wrapper = AdbWrapper(serial, logger)
-
-      if is_hubble_installed(adb_wrapper, logger):
-        logger.debug("Removing previous Hubble installation...")
-        with events.step("uninstall_previous", serial) as s:
-          if not remove_previous_installation(adb_wrapper):
-            logger.error("Failed to remove previous Hubble installation.")
-            device_error = _error(REASON_UNINSTALL_FAILED, s.fail(
-                "Failed to remove previous Hubble installation."))
-            has_errors = True
-            continue
-
-      with events.step("install_hubble", serial) as s:
-        if is_xiaomi_phone(adb_wrapper, logger):
-          logger.info("This is a Xiaomi phone.")
-          adb_push_hubble(adb_wrapper, args.hubble)
-          if not launch_xiaomi_file_explorer(adb_wrapper):
-            logger.error("Failed to launch Xiaomi file explorer")
-          if not wait_for_xiaomi_manual_install(adb_wrapper, serial, logger,
-                                                events):
-            device_error = _error(REASON_STDIN_CLOSED, s.fail(
-                "Standard input closed while waiting for manual Hubble "
-                "installation."))
-            has_errors = True
-            continue
-        else:
-          logger.info("This is not a Xiaomi phone. Regular workflow continues...")
-          if not install_hubble(adb_wrapper, args, logger):
-            logger.error("Error installing Hubble: %s", adb_wrapper.error_message)
-            device_error = _error(REASON_INSTALL_FAILED, s.fail(
-                "Error installing Hubble: {}".format(
-                    adb_wrapper.error_message)))
-            has_errors = True
-            continue
-
-      with events.step("launch_hubble", serial) as s:
-        clear_logcat(adb_wrapper)
-        if not launch_hubble(adb_wrapper):
-          logger.error("Failed to launch Hubble: %s", adb_wrapper.error_message)
-          device_error = _error(REASON_LAUNCH_FAILED, s.fail(
-              "Failed to launch Hubble: {}".format(adb_wrapper.error_message)))
-          has_errors = True
-          continue
-
-      with events.step("wait_for_results", serial) as s:
-        results_source = wait_for_results(adb_wrapper, logger)
-        if not results_source:
-          logger.error("Failed to obtain results from Hubble execution.")
-          device_error = _error(REASON_NO_RESULTS, s.fail(
-              "Failed to obtain results from Hubble execution."))
-          has_errors = True
-          continue
-
-      with events.step("extract_results", serial) as s:
-        extract_apks = (args.pull_all_apks is not None) or args.pull_preinstalled_apks_only
-        with tempfile.TemporaryDirectory() as device_tmp_dir:
-          results_dir = extract_results_and_apks(
-              adb_wrapper,
-              results_source,
-              args.output,
-              logger,
-              extract_apks,
-              pull_preinstalled_only=args.pull_preinstalled_apks_only,
-              tmp_dir=device_tmp_dir,
-              events=events)
-
-        if not results_dir:
-          logger.error("Failed to extract results from target device (%s).",
-                       serial)
-          device_error = _error(REASON_EXTRACT_FAILED, s.fail(
-              "Failed to extract results from device."))
-          has_errors = True
-          continue
-
-      with events.step("extract_selinux", serial):
-        extract_selinux_policies(adb_wrapper, results_dir, logger)
-      results[serial] = results_dir
-
-      if args.perform_inclusion_proof_check:
-        pkg_filename = (
-            "preinstalled_packages.txt"
-            if args.check_preinstalled_only
-            else "packages.txt"
-        )
-        packages_txt_path = os.path.join(results_dir, "results", pkg_filename)
-        if args.check_preinstalled_only and not os.path.isfile(packages_txt_path):
-          with events.step("inclusion_proof_check", serial) as s:
-            logger.error(
-                "preinstalled_packages.txt not found at %s (extracted results at %s). "
-                "--check_preinstalled_only requires Hubble >= 2.1.0.",
-                packages_txt_path, results_dir)
-            device_error = _error(
-                REASON_INCLUSION_PROOF_CHECK_INCOMPLETE,
-                s.fail("preinstalled_packages.txt not found; "
-                       "--check_preinstalled_only requires Hubble >= 2.1.0."))
-          has_errors = True
-          verification_failed_devices.add(serial)
-          continue
-        if (not args.no_prefetch and not prefetched and
-            os.path.isfile(packages_txt_path)):
-          with events.step("inclusion_proof_prefetch", serial) as s:
-            prefetched = inclusion_proof_check.prefetch_log_entries(
-                args.verifier_path,
-                logger,
-                cache_dir=args.cache_dir,
-                concurrency=args.cache_prefetch_concurrency,
-                timeout=args.cache_prefetch_timeout)
-            if not prefetched:
-              s.fail("Pre-fetching failed; falling back to on-demand "
-                     "fetching.")
-        with events.step("inclusion_proof_check", serial) as s:
-          if not inclusion_proof_check.perform_inclusion_proof_check(
-              args.verifier_path,
-              packages_txt_path,
-              logger,
-              cache_dir=args.cache_dir,
-              concurrency=args.cache_prefetch_concurrency,
-              timeout=args.cache_prefetch_timeout,
-              prefetch=False,
-              preinstalled_only=args.check_preinstalled_only):
-            has_errors = True
-            verification_failed_devices.add(serial)
-            # False means the check could not complete (bad input or
-            # unwritable output), not that some splits are absent from the
-            # log; per-split results are in the *_signal.txt output.
-            device_error = _error(REASON_INCLUSION_PROOF_CHECK_INCOMPLETE,
-                                  s.fail("Inclusion proof check could not "
-                                         "complete."))
-    except Exception as e:
-      logger.exception("Unexpected error while processing device %s: %s",
-                       serial, e)
-      device_error = _error(REASON_UNEXPECTED_ERROR,
-                            "{}: {}".format(type(e).__name__, e))
-      has_errors = True
-      if serial in results:
-        collection_error_devices.add(serial)
-    except BaseException as e:
-      # KeyboardInterrupt and other non-Exception exits bypass the handler
-      # above. Record them before propagating, so the device_finished event
-      # in the finally block does not report an interrupted device as a
-      # success when its results were already collected.
-      device_error = _interruption_error(e)
-      if serial in results:
-        collection_error_devices.add(serial)
-      raise
-    finally:
-      events.device_finished(
-          serial,
-          device_status(serial, results, missing_serials,
-                        collection_error_devices,
-                        verification_failed_devices),
-          results_dir=results.get(serial),
-          error=device_error)
+    result = process_device(target_device, args, logger, events, state)
+    # Decided per device, not from `outcomes`: two connected devices can
+    # share a serial, and the second must not hide the first one's failure.
+    has_errors = has_errors or result.status != STATUS_SUCCESS
+    outcomes[target_device.serial_number] = result
 
   # Summarise in the order devices were requested (or discovered, without
   # --serial), including requested serials that were never connected.
-  missing = set(missing_serials)
   summary_serials = list(dict.fromkeys(
       args.serial if args.serial is not None
       else [d.serial_number for d in connected_devices]))
-  summary = {}
-  for device in summary_serials:
-    status = device_status(device, results, missing,
-                           collection_error_devices,
-                           verification_failed_devices)
-    summary[device] = {"status": status}
-    if device in results:
-      summary[device]["results_dir"] = results[device]
-
-    if device in missing:
-      logger.error(
-          "FAILED: Requested device %s is not connected (exiting 1).",
-          device)
-      continue
-    if status == STATUS_FAILED:
-      logger.error(
-          "FAILED: Hubble data collection failed on connected device %s "
-          "(exiting 1).",
-          device)
-      continue
-    if status == STATUS_PARTIAL_ERROR:
-      logger.warning(
-          "PARTIAL SUCCESS: Hubble data collection succeeded on connected "
-          "device %s, but an unexpected error occurred during post-collection "
-          "processing (exiting 1).",
-          device)
-    elif status == STATUS_PARTIAL_CHECK_INCOMPLETE:
-      logger.warning(
-          "PARTIAL SUCCESS: Hubble data collection succeeded on connected "
-          "device %s, but inclusion proof verification failed (exiting 1).",
-          device)
-    else:
-      logger.info("SUCCESS! Hubble was successfully deployed and executed on "
-                  "connected device %s.", device)
-    logger.info("Hubble output files can be found at: %s", results[device])
+  summary = print_summary(summary_serials, outcomes, missing_serials, logger)
 
   exit_code = 1 if has_errors else 0
   events.finish_run(exit_code, summary=summary)

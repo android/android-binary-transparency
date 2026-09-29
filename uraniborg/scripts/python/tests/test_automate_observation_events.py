@@ -174,24 +174,6 @@ def test_finish_run_is_emitted_once_with_ok_semantics():
     assert event["summary"] == {}
 
 
-@pytest.mark.parametrize(
-    "serial, expected",
-    [
-        ("MISSING", automate_observation.STATUS_FAILED),
-        ("NO_RESULTS", automate_observation.STATUS_FAILED),
-        ("POST_ERR", automate_observation.STATUS_PARTIAL_ERROR),
-        ("BOTH", automate_observation.STATUS_PARTIAL_ERROR),
-        ("VERIFY", automate_observation.STATUS_PARTIAL_CHECK_INCOMPLETE),
-        ("OK", automate_observation.STATUS_SUCCESS),
-    ],
-)
-def test_device_status(serial, expected):
-  results = {s: "/r/" + s for s in ("POST_ERR", "BOTH", "VERIFY", "OK")}
-  assert automate_observation.device_status(
-      serial, results, {"MISSING"}, {"POST_ERR", "BOTH"},
-      {"VERIFY", "BOTH"}) == expected
-
-
 def test_device_to_event_skips_empty_and_non_string_attributes():
   dev = automate_observation.syscall_wrapper.DeviceInfo()
   dev.serial_number = "S1"
