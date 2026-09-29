@@ -145,6 +145,54 @@ def parse_arguments() -> argparse.Namespace:
   return args
 
 
+def validate_argument_combinations(args: argparse.Namespace) -> list[str]:
+  """Finds flags that are ignored because of how they are combined.
+
+  These combinations are not errors, so that existing invocations keep
+  working; run() logs each returned message as a warning. Combinations that
+  cannot work at all are rejected by parse_arguments() instead.
+
+  Args:
+    args: Parsed arguments from parse_arguments().
+
+  Returns:
+    One human-readable warning per ignored flag or conflict, in a stable
+    order. Empty if nothing is ignored.
+  """
+  warnings = []
+  # Integer flags always have a value, so only a non-default one counts as
+  # given. Only prefetch_log_entries() reads them.
+  prefetch_tuning = [
+      ("--cache_prefetch_concurrency",
+       args.cache_prefetch_concurrency !=
+       inclusion_proof_check.DEFAULT_PREFETCH_CONCURRENCY),
+      ("--cache_prefetch_timeout",
+       args.cache_prefetch_timeout !=
+       inclusion_proof_check.DEFAULT_PREFETCH_TIMEOUT),
+  ]
+  if not args.perform_inclusion_proof_check:
+    ignored = [
+        ("--check_preinstalled_only", args.check_preinstalled_only),
+        ("--verifier_path", args.verifier_path is not None),
+        ("--no_prefetch", args.no_prefetch),
+        ("--cache_dir", args.cache_dir is not None),
+    ] + prefetch_tuning
+    for flag, given in ignored:
+      if given:
+        warnings.append("{} has no effect without "
+                        "--perform_inclusion_proof_check.".format(flag))
+  elif args.no_prefetch:
+    # Pre-fetching is skipped, so its tuning flags are unused. --cache_dir is
+    # not: verification itself still uses the cache.
+    for flag, given in prefetch_tuning:
+      if given:
+        warnings.append("{} has no effect with --no_prefetch.".format(flag))
+  if args.pull_all_apks is not None and args.pull_preinstalled_apks_only:
+    warnings.append("--pull-all-apks and --pull-preinstalled-apks-only were "
+                    "both given; only pre-installed APKs will be pulled.")
+  return warnings
+
+
 def set_up_logging(args: argparse.Namespace) -> logging.Logger:
   """Sets up various logging parameters.
 
@@ -1321,6 +1369,8 @@ def run(args: argparse.Namespace, logger: logging.Logger,
     return 0, as they always have; run_finished.error describes them.
   """
   events.emit("run_started", argv=sys.argv[1:], pid=os.getpid())
+  for warning in validate_argument_combinations(args):
+    logger.warning(warning)
 
   def early_exit(reason: str, message: str) -> int:
     events.finish_run(0, error=_error(reason, message))

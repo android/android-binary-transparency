@@ -1876,5 +1876,129 @@ def test_main_without_serial_no_devices_keeps_early_return(
   m["logger"].error.assert_any_call("No devices connected!")
 
 
+_NO_PROOF = "has no effect without --perform_inclusion_proof_check."
+_BOTH_PULL = ("--pull-all-apks and --pull-preinstalled-apks-only were both "
+              "given; only pre-installed APKs will be pulled.")
+_PROOF = ("--perform_inclusion_proof_check", "--verifier_path=/v")
+
+
+def _warnings_for(monkeypatch: pytest.MonkeyPatch, *extra: str) -> list[str]:
+  _set_argv(monkeypatch, *extra)
+  return automate_observation.validate_argument_combinations(
+      automate_observation.parse_arguments())
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        (),
+        _PROOF,
+        (*_PROOF, "--check_preinstalled_only", "--cache_dir=/c",
+         "--cache_prefetch_concurrency=4", "--cache_prefetch_timeout=30"),
+        # Verification still uses the cache when pre-fetching is off.
+        (*_PROOF, "--no_prefetch", "--cache_dir=/c"),
+        ("--pull-all-apks",),
+        ("--pull-preinstalled-apks-only",),
+        (*_PROOF, "--pull-all-apks"),
+        # Integer flags set to their defaults count as not given.
+        ("--cache_prefetch_concurrency={}".format(
+            inclusion_proof_check.DEFAULT_PREFETCH_CONCURRENCY),
+         "--cache_prefetch_timeout={}".format(
+             inclusion_proof_check.DEFAULT_PREFETCH_TIMEOUT)),
+    ],
+    ids=["defaults", "proof_check", "proof_check_all_options",
+         "no_prefetch_with_cache_dir", "pull_all",
+         "pull_preinstalled", "proof_check_and_pull_all",
+         "explicit_int_defaults"],
+)
+def test_validate_argument_combinations_no_warnings(
+    monkeypatch: pytest.MonkeyPatch, extra,
+):
+  assert _warnings_for(monkeypatch, *extra) == []
+
+
+@pytest.mark.parametrize(
+    "extra, expected",
+    [
+        (("--check_preinstalled_only",),
+         "--check_preinstalled_only " + _NO_PROOF),
+        (("--verifier_path=/v",), "--verifier_path " + _NO_PROOF),
+        (("--no_prefetch",), "--no_prefetch " + _NO_PROOF),
+        (("--cache_dir=/c",), "--cache_dir " + _NO_PROOF),
+        (("--cache_prefetch_concurrency=4",),
+         "--cache_prefetch_concurrency " + _NO_PROOF),
+        (("--cache_prefetch_timeout=30",),
+         "--cache_prefetch_timeout " + _NO_PROOF),
+        ((*_PROOF, "--no_prefetch", "--cache_prefetch_concurrency=4"),
+         "--cache_prefetch_concurrency has no effect with --no_prefetch."),
+        ((*_PROOF, "--no_prefetch", "--cache_prefetch_timeout=30"),
+         "--cache_prefetch_timeout has no effect with --no_prefetch."),
+        (("--pull-all-apks", "--pull-preinstalled-apks-only"), _BOTH_PULL),
+    ],
+    ids=["check_preinstalled_only", "verifier_path", "no_prefetch",
+         "cache_dir", "cache_prefetch_concurrency", "cache_prefetch_timeout",
+         "no_prefetch_concurrency", "no_prefetch_timeout", "both_pull_flags"],
+)
+def test_validate_argument_combinations_one_warning_each(
+    monkeypatch: pytest.MonkeyPatch, extra, expected,
+):
+  assert _warnings_for(monkeypatch, *extra) == [expected]
+
+
+def test_validate_argument_combinations_reports_all_in_stable_order(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  assert _warnings_for(
+      monkeypatch, "--pull-preinstalled-apks-only", "--pull-all-apks",
+      "--cache_dir=/c", "--check_preinstalled_only") == [
+          "--check_preinstalled_only " + _NO_PROOF,
+          "--cache_dir " + _NO_PROOF,
+          _BOTH_PULL,
+      ]
+
+
+def test_validate_argument_combinations_no_prefetch_with_both_tuning_flags(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  assert _warnings_for(
+      monkeypatch, *_PROOF, "--no_prefetch", "--cache_prefetch_concurrency=4",
+      "--cache_prefetch_timeout=30") == [
+          "--cache_prefetch_concurrency has no effect with --no_prefetch.",
+          "--cache_prefetch_timeout has no effect with --no_prefetch.",
+      ]
+  # Without the proof check, each flag gets only the "without" warning.
+  assert _warnings_for(
+      monkeypatch, "--no_prefetch", "--cache_prefetch_timeout=30") == [
+          "--no_prefetch " + _NO_PROOF,
+          "--cache_prefetch_timeout " + _NO_PROOF,
+      ]
+
+
+def test_main_logs_argument_warnings_before_doing_any_work(
+    serial_main_mocks, monkeypatch: pytest.MonkeyPatch,
+):
+  m = serial_main_mocks
+  m["supported_platform"].return_value = False  # stop right after the checks
+  _set_argv(monkeypatch, "--no_prefetch", "--pull-all-apks",
+            "--pull-preinstalled-apks-only")
+
+  automate_observation.main()
+
+  assert m["logger"].warning.call_args_list == [
+      mock.call("--no_prefetch " + _NO_PROOF), mock.call(_BOTH_PULL)]
+
+
+def test_main_logs_no_argument_warnings_by_default(
+    serial_main_mocks, monkeypatch: pytest.MonkeyPatch,
+):
+  m = serial_main_mocks
+  m["AdbWrapper"].devices.return_value = [_make_mock_device("DEV1")]
+  _set_argv(monkeypatch)
+
+  automate_observation.main()
+
+  m["logger"].warning.assert_not_called()
+
+
 if __name__ == "__main__":
   sys.exit(pytest.main([__file__]))
