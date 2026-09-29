@@ -17,6 +17,7 @@
 """Unit tests for automate_observation.py CLI parsing and multi-device prefetch latch."""
 
 import argparse
+import contextlib
 import io
 import json
 import os
@@ -1652,6 +1653,224 @@ def test_main_multi_device_exception_isolation_and_exit_code(
   mock_logger.info.assert_any_call(
       "Hubble output files can be found at: %s", "/tmp/out/DEV3"
   )
+
+
+# --- --serial -----------------------------------------------------------------
+
+
+_MULTI_DEVICE_WARNING = "More than 1 device connected!"
+
+
+@pytest.fixture
+def serial_main_mocks():
+  """Patches main()'s collaborators so every device collects successfully.
+
+  extract_results_and_apks returns /tmp/out/<serial> for whichever device is
+  being processed, so tests can assert exactly which devices ran.
+  """
+  patch_targets = [
+      "supported_platform", "verify_hubble", "adb_installed", "AdbWrapper",
+      "is_hubble_installed", "is_xiaomi_phone", "install_hubble",
+      "clear_logcat", "launch_hubble", "wait_for_results",
+      "extract_results_and_apks", "extract_selinux_policies",
+      "set_up_logging",
+  ]
+  with contextlib.ExitStack() as stack:
+    mocks = {
+        name: stack.enter_context(mock.patch(f"automate_observation.{name}"))
+        for name in patch_targets
+    }
+    mocks["supported_platform"].return_value = True
+    mocks["verify_hubble"].return_value = True
+    mocks["adb_installed"].return_value = True
+    mocks["AdbWrapper"].start_server.return_value = True
+    mocks["is_hubble_installed"].return_value = False
+    mocks["is_xiaomi_phone"].return_value = False
+    mocks["install_hubble"].return_value = True
+    mocks["launch_hubble"].return_value = True
+    mocks["wait_for_results"].return_value = "/sdcard/hubble/results"
+
+    processed = []
+
+    def _adb_wrapper_ctor(serial, logger):
+      processed.append(serial)
+      return mock.Mock()
+
+    mocks["AdbWrapper"].side_effect = _adb_wrapper_ctor
+    mocks["extract_results_and_apks"].side_effect = (
+        lambda *a, **kw: f"/tmp/out/{processed[-1]}")
+    mocks["logger"] = mock.Mock()
+    mocks["set_up_logging"].return_value = mocks["logger"]
+    mocks["processed"] = processed
+    yield mocks
+
+
+def _set_argv(monkeypatch: pytest.MonkeyPatch, *extra: str):
+  monkeypatch.setattr(
+      sys, "argv",
+      ["automate_observation.py", "-H", "/path/to/hubble.apk",
+       "-o", "/tmp/out", *extra])
+
+
+def test_parse_arguments_serial_default_and_repeatable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  """--serial defaults to None and accumulates in order across -s/--serial."""
+  monkeypatch.setattr(sys, "argv", ["automate_observation.py"])
+  assert automate_observation.parse_arguments().serial is None
+
+  monkeypatch.setattr(
+      sys, "argv",
+      ["automate_observation.py", "-s", "B", "--serial", "A", "--serial=C"])
+  assert automate_observation.parse_arguments().serial == ["B", "A", "C"]
+
+
+def test_select_target_devices_without_serial_returns_all():
+  logger = mock.Mock()
+  devices = [_make_mock_device("A"), _make_mock_device("B")]
+  targets, missing = automate_observation.select_target_devices(
+      devices, None, logger)
+  assert targets == devices
+  assert targets is not devices  # a copy, so callers cannot mutate the input
+  assert missing == []
+  logger.error.assert_not_called()
+
+
+def test_select_target_devices_filters_orders_dedupes_and_reports_missing():
+  logger = mock.Mock()
+  a, b, c = (_make_mock_device(s) for s in ("A", "B", "C"))
+  targets, missing = automate_observation.select_target_devices(
+      [a, b, c], ["C", "GONE1", "A", "C", "GONE2", "GONE1"], logger)
+  assert targets == [c, a]
+  assert missing == ["GONE1", "GONE2"]
+  assert logger.error.call_count == 2
+  logger.error.assert_any_call(
+      "Requested device with serial number %s is not connected.", "GONE1")
+  logger.error.assert_any_call(
+      "Requested device with serial number %s is not connected.", "GONE2")
+
+
+def test_select_target_devices_empty_request_selects_nothing():
+  targets, missing = automate_observation.select_target_devices(
+      [_make_mock_device("A")], [], mock.Mock())
+  assert targets == []
+  assert missing == []
+
+
+def test_main_serial_limits_and_orders_devices(
+    serial_main_mocks, monkeypatch: pytest.MonkeyPatch,
+):
+  """Only requested devices run, in request order, without the multi-device warning."""
+  m = serial_main_mocks
+  m["AdbWrapper"].devices.return_value = [
+      _make_mock_device("DEV1"),
+      _make_mock_device("DEV2"),
+      _make_mock_device("DEV3"),
+  ]
+  _set_argv(monkeypatch, "--serial", "DEV3", "-s", "DEV1")
+
+  automate_observation.main()  # no SystemExit: every selected device succeeded
+
+  assert m["processed"] == ["DEV3", "DEV1"]
+  assert m["install_hubble"].call_count == 2
+  for call in m["logger"].warning.call_args_list:
+    assert call.args != (_MULTI_DEVICE_WARNING,)
+
+  success_msg = ("SUCCESS! Hubble was successfully deployed and executed on "
+                 "connected device %s.")
+  success_calls = [c.args for c in m["logger"].info.call_args_list
+                   if c.args and c.args[0] == success_msg]
+  assert success_calls == [(success_msg, "DEV3"), (success_msg, "DEV1")]
+
+
+def test_main_serial_not_connected_is_reported_failed_and_exits_1(
+    serial_main_mocks, monkeypatch: pytest.MonkeyPatch,
+):
+  """A requested serial that is not connected fails loudly; others still run."""
+  m = serial_main_mocks
+  m["AdbWrapper"].devices.return_value = [
+      _make_mock_device("DEV1"),
+      _make_mock_device("DEV2"),
+  ]
+  _set_argv(monkeypatch, "--serial", "GONE", "--serial", "DEV1")
+
+  with pytest.raises(SystemExit) as exc_info:
+    automate_observation.main()
+  assert exc_info.value.code == 1
+
+  assert m["processed"] == ["DEV1"]
+  m["logger"].error.assert_any_call(
+      "Requested device with serial number %s is not connected.", "GONE")
+  m["logger"].error.assert_any_call(
+      "FAILED: Requested device %s is not connected (exiting 1).", "GONE")
+  # The generic collection-failure line is reserved for connected devices.
+  for call in m["logger"].error.call_args_list:
+    assert call.args != (
+        "FAILED: Hubble data collection failed on connected device %s "
+        "(exiting 1).",
+        "GONE",
+    )
+  m["logger"].info.assert_any_call(
+      "SUCCESS! Hubble was successfully deployed and executed on "
+      "connected device %s.",
+      "DEV1",
+  )
+  # DEV2 was not requested, so it must not appear in the summary at all.
+  for method in (m["logger"].info, m["logger"].warning, m["logger"].error):
+    for call in method.call_args_list:
+      assert "DEV2" not in call.args
+
+
+def test_main_without_serial_still_runs_all_and_warns(
+    serial_main_mocks, monkeypatch: pytest.MonkeyPatch,
+):
+  """Default behaviour is unchanged: all devices run and the warning is kept."""
+  m = serial_main_mocks
+  m["AdbWrapper"].devices.return_value = [
+      _make_mock_device("DEV1"),
+      _make_mock_device("DEV2"),
+  ]
+  _set_argv(monkeypatch)
+
+  automate_observation.main()
+
+  assert m["processed"] == ["DEV1", "DEV2"]
+  m["logger"].warning.assert_any_call(_MULTI_DEVICE_WARNING)
+
+
+@pytest.mark.parametrize("listing", [[], None], ids=["empty", "adb_failed"])
+def test_main_serial_with_no_connected_devices_fails_and_exits_1(
+    serial_main_mocks, monkeypatch: pytest.MonkeyPatch, listing,
+):
+  """--serial must not be swallowed by the "No devices connected!" early return."""
+  m = serial_main_mocks
+  m["AdbWrapper"].devices.return_value = listing
+  _set_argv(monkeypatch, "--serial", "GONE")
+
+  with pytest.raises(SystemExit) as exc_info:
+    automate_observation.main()
+  assert exc_info.value.code == 1
+
+  assert m["processed"] == []
+  m["logger"].error.assert_any_call(
+      "FAILED: Requested device %s is not connected (exiting 1).", "GONE")
+  for call in m["logger"].error.call_args_list:
+    assert call.args != ("No devices connected!",)
+
+
+@pytest.mark.parametrize("listing", [[], None], ids=["empty", "adb_failed"])
+def test_main_without_serial_no_devices_keeps_early_return(
+    serial_main_mocks, monkeypatch: pytest.MonkeyPatch, listing,
+):
+  """Without --serial, the pre-existing early return (exit 0) is unchanged."""
+  m = serial_main_mocks
+  m["AdbWrapper"].devices.return_value = listing
+  _set_argv(monkeypatch)
+
+  automate_observation.main()  # no SystemExit
+
+  assert m["processed"] == []
+  m["logger"].error.assert_any_call("No devices connected!")
 
 
 if __name__ == "__main__":
