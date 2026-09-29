@@ -42,6 +42,24 @@ A requested serial that is not connected is not silently skipped: it is logged
 as an error, reported as `FAILED` in the final summary, and makes the script
 exit with code `1`. The remaining requested devices are still observed.
 
+### Ignored Flag Combinations
+
+Some flags only matter together with others. When a flag would be ignored, the
+script logs a warning at startup and then runs as it otherwise would; the exit
+code is not affected:
+
+- `--check_preinstalled_only`, `--verifier_path`, `--no_prefetch`,
+  `--cache_dir`, `--cache_prefetch_concurrency` and `--cache_prefetch_timeout`
+  have no effect without `--perform_inclusion_proof_check`. The two integer
+  flags only count as given when their value differs from the default.
+- `--cache_prefetch_concurrency` and `--cache_prefetch_timeout` also have no
+  effect with `--no_prefetch`, since they only tune pre-fetching.
+  (`--cache_dir` is still used: verification reads the cache.)
+- `--pull-all-apks` together with `--pull-preinstalled-apks-only` pulls only
+  pre-installed APKs.
+
+`--perform_inclusion_proof_check` without `--verifier_path` remains an error.
+
 ### Machine-Readable Progress (`--events`)
 
 Log messages are meant for people and may change between versions. Wrappers
