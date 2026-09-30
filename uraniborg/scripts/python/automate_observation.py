@@ -39,6 +39,7 @@ import zlib  # to decompress adb backup
 
 import inclusion_proof_check
 import syscall_wrapper
+import termination
 
 AdbWrapper = syscall_wrapper.AdbWrapper
 SyscallWrapper = syscall_wrapper.SyscallWrapper
@@ -227,6 +228,10 @@ def set_up_logging(args: argparse.Namespace) -> logging.Logger:
 
 EVENTS_SCHEMA_VERSION = 1
 
+# step_progress events are written at most this often (plus the first and
+# the final one of each step).
+STEP_PROGRESS_INTERVAL_SECONDS = 2.0
+
 # Per-device outcomes. These are the same four outcomes the final log summary
 # distinguishes.
 STATUS_SUCCESS = "success"
@@ -273,30 +278,11 @@ PROMPT_OUTCOME_FAILED = "failed"
 PROMPT_OUTCOME_STDIN_CLOSED = REASON_STDIN_CLOSED
 
 
-class Terminated(BaseException):
-  """Raised by the SIGTERM handler that main() installs while --events is on.
-
-  Derives from BaseException, like KeyboardInterrupt, so that the generic
-  `except Exception` handlers do not swallow it. SyscallWrapper only catches
-  KeyboardInterrupt, so this also propagates out of adb calls.
-  """
-
-  def __init__(self):
-    super().__init__("received SIGTERM")
-
-
-def _raise_terminated(signum, frame):  # pylint: disable=unused-argument
-  # Ignore repeated SIGTERMs while cleaning up so that run_finished is still
-  # written; _die_by_sigterm() restores the default action afterwards.
-  signal.signal(signal.SIGTERM, signal.SIG_IGN)
-  raise Terminated()
-
-
 def _interruption_error(e: BaseException) -> dict:
   """Describes an exception that is not an Exception, for device errors."""
   if isinstance(e, KeyboardInterrupt):
     return _error(REASON_INTERRUPTED, "Interrupted.")
-  if isinstance(e, Terminated):
+  if isinstance(e, termination.Terminated):
     return _error(REASON_TERMINATED, "Terminated.")
   return _error(REASON_UNEXPECTED_ERROR,
                 "{}: {}".format(type(e).__name__, e))
@@ -359,11 +345,13 @@ class EventEmitter:
 
   def __init__(self, stream: Optional[TextIO] = None,
                logger: Optional[logging.Logger] = None,
-               clock=None):
+               clock=None, monotonic=None):
     self._stream = stream
     self._logger = logger
     self._clock = clock or (
         lambda: datetime.datetime.now(datetime.timezone.utc))
+    # Used only to throttle step_progress events.
+    self._monotonic = monotonic or time.monotonic
     self._run_finished = False
     # serial -> {status, results_dir?}, in device_finished order.
     self._finished_devices = {}
@@ -401,6 +389,31 @@ class EventEmitter:
     self._finished_devices[device] = entry
     self.emit("device_finished", device=device, status=status,
               results_dir=results_dir, error=error)
+
+  def progress_reporter(
+      self, step: str, device: Optional[str] = None,
+      interval: float = STEP_PROGRESS_INTERVAL_SECONDS):
+    """Returns a progress(done, total) callback emitting step_progress.
+
+    Meant to be called often (e.g. once per item); events are throttled:
+    the first call is always reported, and so is the one where done reaches
+    total, but in between at most one event is written per `interval`
+    seconds. A call repeating the last reported `done` is never reported.
+    """
+    last = {"done": None, "at": None}
+
+    def report(done: int, total: int) -> None:
+      if self._stream is None or done == last["done"]:
+        return
+      now = self._monotonic()
+      if (last["at"] is not None and done != total and
+          now - last["at"] < interval):
+        return
+      last["done"], last["at"] = done, now
+      self.emit("step_progress", step=step, device=device, done=done,
+                total=total)
+
+    return report
 
   @contextlib.contextmanager
   def step(self, name: str, device: Optional[str] = None):
@@ -1559,7 +1572,8 @@ def _observe_device(target_device, args: argparse.Namespace,
         concurrency=args.cache_prefetch_concurrency,
         timeout=args.cache_prefetch_timeout,
         prefetch=False,
-        preinstalled_only=args.check_preinstalled_only):
+        preinstalled_only=args.check_preinstalled_only,
+        progress=events.progress_reporter("inclusion_proof_check", serial)):
       progress.check_incomplete = True
       # False means the check could not complete (bad input or unwritable
       # output), not that some splits are absent from the log; per-split
@@ -1748,44 +1762,31 @@ def main():
   # being written, turn it into an exception so the run can report itself,
   # then die by SIGTERM anyway so the parent sees the usual exit status.
   # Without --events, SIGTERM handling is left untouched.
-  previous_sigterm_handler = None
-  if events.enabled:
-    previous_sigterm_handler = signal.signal(signal.SIGTERM, _raise_terminated)
-
   terminated = False
-  try:
-    exit_code = run(args, logger, events)
-  except Terminated:
-    events.finish_run(128 + signal.SIGTERM, error=_error(
-        REASON_TERMINATED, "Terminated by SIGTERM."))
-    terminated = True
-  except KeyboardInterrupt:
-    events.finish_run(130, error=_error(REASON_INTERRUPTED,
-                                            "Interrupted by user."))
-    raise
-  except BaseException as e:
-    events.finish_run(1, error=_error(
-        REASON_UNEXPECTED_ERROR, "{}: {}".format(type(e).__name__, e)))
-    raise
-  finally:
-    events.close()
-    if previous_sigterm_handler is not None:
-      signal.signal(signal.SIGTERM, previous_sigterm_handler)
+  with (termination.sigterm_raises() if events.enabled
+        else contextlib.nullcontext()):
+    try:
+      exit_code = run(args, logger, events)
+    except termination.Terminated:
+      events.finish_run(128 + signal.SIGTERM, error=_error(
+          REASON_TERMINATED, "Terminated by SIGTERM."))
+      terminated = True
+    except KeyboardInterrupt:
+      events.finish_run(130, error=_error(REASON_INTERRUPTED,
+                                              "Interrupted by user."))
+      raise
+    except BaseException as e:
+      events.finish_run(1, error=_error(
+          REASON_UNEXPECTED_ERROR, "{}: {}".format(type(e).__name__, e)))
+      raise
+    finally:
+      events.close()
 
   if terminated:
-    _die_by_sigterm(logger)
+    termination.die_by_sigterm(logger)
     return
   if exit_code:
     sys.exit(exit_code)
-
-
-def _die_by_sigterm(logger):
-  """Terminates this process with SIGTERM's default action."""
-  logger.error("Terminated by SIGTERM.")
-  signal.signal(signal.SIGTERM, signal.SIG_DFL)
-  os.kill(os.getpid(), signal.SIGTERM)
-  # Not reached unless SIGTERM is blocked; fall back to the conventional code.
-  sys.exit(128 + signal.SIGTERM)
 
 
 if __name__ == "__main__":

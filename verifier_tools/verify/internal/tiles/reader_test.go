@@ -416,6 +416,121 @@ func TestTesseraFindPayloadIndex(t *testing.T) {
 	}
 }
 
+func TestTesseraFindPayloadIndices(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("HOME", tempDir)
+	t.Setenv("XDG_CACHE_HOME", tempDir)
+
+	entry := func(i int) []byte { return []byte(fmt.Sprintf("hash_%d\nhash_desc\npackage_%d\n%d\n", i, i, i)) }
+	dup := []byte("hash_dup\nhash_desc\npackage_dup\n1\n")
+
+	// Tile 0 holds indices 0..255 (dup at 5 and 250); tile 1 holds 256..258
+	// (dup at 257).
+	var tile0Entries [][]byte
+	for i := 0; i < 256; i++ {
+		if i == 5 || i == 250 {
+			tile0Entries = append(tile0Entries, dup)
+		} else {
+			tile0Entries = append(tile0Entries, entry(i))
+		}
+	}
+	tile0Data := createTestEntryBundle(tile0Entries)
+	tile1Data := createTestEntryBundle([][]byte{entry(256), dup, entry(258)})
+
+	var tile0Requests, tile1Requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tile/entries/000":
+			tile0Requests.Add(1)
+			w.Write(tile0Data)
+		case "/tile/entries/001.p/3":
+			tile1Requests.Add(1)
+			w.Write(tile1Data)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	// All payloads in the latest tile: tile 0 is never read. Surrounding
+	// whitespace is ignored, as in TesseraFindPayloadIndex.
+	got, err := TesseraFindPayloadIndices(server.URL, 259, [][]byte{entry(258), append([]byte("  "), dup...)})
+	if err != nil {
+		t.Fatalf("TesseraFindPayloadIndices error: %v", err)
+	}
+	want := map[string]int64{string(bytes.TrimSpace(entry(258))): 258, string(bytes.TrimSpace(dup)): 257}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("TesseraFindPayloadIndices mismatch (-want +got):\n%s", diff)
+	}
+	if tile0Requests.Load() != 0 || tile1Requests.Load() != 1 {
+		t.Errorf("requests (tile0, tile1) = (%d, %d), want (0, 1)", tile0Requests.Load(), tile1Requests.Load())
+	}
+
+	// Payloads across both tiles plus one that is absent: every tile is read,
+	// each only once, and the absent payload is omitted.
+	got, err = TesseraFindPayloadIndices(server.URL, 259, [][]byte{entry(3), entry(256), []byte("absent"), entry(3)})
+	if err != nil {
+		t.Fatalf("TesseraFindPayloadIndices error: %v", err)
+	}
+	want = map[string]int64{string(bytes.TrimSpace(entry(3))): 3, string(bytes.TrimSpace(entry(256))): 256}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("TesseraFindPayloadIndices mismatch (-want +got):\n%s", diff)
+	}
+	if tile0Requests.Load() != 1 || tile1Requests.Load() != 1 {
+		t.Errorf("requests (tile0, tile1) = (%d, %d), want (1, 1)", tile0Requests.Load(), tile1Requests.Load())
+	}
+
+	// No payloads, or an empty tree: nothing to search.
+	for _, tc := range []struct {
+		size     int64
+		payloads [][]byte
+	}{{259, nil}, {0, [][]byte{entry(3)}}} {
+		got, err := TesseraFindPayloadIndices(server.URL, tc.size, tc.payloads)
+		if err != nil || len(got) != 0 {
+			t.Errorf("TesseraFindPayloadIndices(size=%d, %d payloads) = (%v, %v), want empty map", tc.size, len(tc.payloads), got, err)
+		}
+	}
+}
+
+func TestTesseraFindPayloadIndicesKeepsMatchesOnTileError(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("HOME", tempDir)
+	t.Setenv("XDG_CACHE_HOME", tempDir)
+
+	entry := func(i int) []byte { return []byte(fmt.Sprintf("hash_%d\nhash_desc\npackage_%d\n%d\n", i, i, i)) }
+	tile1Data := createTestEntryBundle([][]byte{entry(256), entry(257)})
+
+	// Tile 0 (the oldest) fails; tile 1 is served.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tile/entries/001.p/2":
+			w.Write(tile1Data)
+		case "/tile/entries/000":
+			http.Error(w, "boom", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	// entry(3) would be in tile 0, so the search reaches it and fails. The
+	// match from tile 1 is exact and must be kept alongside the error.
+	got, err := TesseraFindPayloadIndices(server.URL, 258, [][]byte{entry(257), entry(3)})
+	if err == nil {
+		t.Fatalf("TesseraFindPayloadIndices error = nil, want tile 0 failure")
+	}
+	want := map[string]int64{string(bytes.TrimSpace(entry(257))): 257}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("TesseraFindPayloadIndices partial result mismatch (-want +got):\n%s", diff)
+	}
+
+	// A single-payload search that is satisfied by tile 1 never reaches the
+	// failing tile.
+	if idx, found, err := TesseraFindPayloadIndex(server.URL, 258, entry(257)); err != nil || !found || idx != 257 {
+		t.Errorf("TesseraFindPayloadIndex = (%d, %v, %v), want (257, true, nil)", idx, found, err)
+	}
+}
+
 func createTestEntryBundle(entries [][]byte) []byte {
 	var buf bytes.Buffer
 	for _, entry := range entries {

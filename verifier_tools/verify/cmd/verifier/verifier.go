@@ -22,11 +22,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 
 	"github.com/android/android-binary-transparency/verifier_tools/verify/internal/checkpoint"
@@ -83,6 +87,7 @@ var mainlineModuleLogPubKey []byte
 
 var (
 	payloadPath  = flag.String("payload_path", "", "Path to the payload describing the binary of interest.")
+	payloadsPath = flag.String("payloads_path", "", "Path to a JSON Lines file of payloads to verify in one run, one {\"payload\": \"...\"} object per line. Writes one JSON result per payload to stdout.")
 	logType      = flag.String("log_type", "", "Which log: 'pixel' or 'google_1p_code' or 'google_1p_apk' or 'mainline_module'.")
 	fetchEntries = flag.Bool("fetch_entries", false, "Pre-fetch and cache all entries/tiles locally for the specified --log_type, without performing an inclusion proof.")
 	concurrency  = flag.Int("concurrency", tiles.DefaultTesseraFetchConcurrency, "Number of concurrent workers for fetching Tessera entry tiles.")
@@ -92,6 +97,7 @@ var (
 func init() {
 	flag.StringVar(logType, "log-type", "", "Alias for --log_type.")
 	flag.StringVar(payloadPath, "payload-path", "", "Alias for --payload_path.")
+	flag.StringVar(payloadsPath, "payloads-path", "", "Alias for --payloads_path.")
 	flag.StringVar(cacheDir, "cache-dir", "", "Alias for --cache_dir.")
 	flag.BoolVar(fetchEntries, "fetch-entries", false, "Alias for --fetch_entries.")
 
@@ -102,14 +108,17 @@ Modes:
   1. Verify binary inclusion in transparency log:
      %s --log_type=<log_type> --payload_path=<path_to_payload> [--cache_dir=<path>]
 
-  2. Pre-fetch and cache entries locally for offline verification:
+  2. Verify many binaries in one run (JSON Lines in, JSON Lines out):
+     %s --log_type=<log_type> --payloads_path=<path_to_payloads.jsonl> [--cache_dir=<path>]
+
+  3. Pre-fetch and cache entries locally for offline verification:
      %s --log_type=<log_type> --fetch_entries [--concurrency=16] [--cache_dir=<path>]
 
 Supported log types:
   pixel, google_1p_code, google_1p_apk, mainline_module
 
 Flags:
-`, os.Args[0], os.Args[0], os.Args[0])
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 		flag.PrintDefaults()
 	}
 }
@@ -291,8 +300,17 @@ func main() {
 		return
 	}
 
+	if *payloadsPath != "" {
+		if *payloadPath != "" {
+			slog.Error("specify only one of '--payload_path' and '--payloads_path'")
+			flag.Usage()
+			os.Exit(1)
+		}
+		os.Exit(runBatch(ctx, targets, *payloadsPath, os.Stdout))
+	}
+
 	if *payloadPath == "" {
-		slog.Error("must specify either '--payload_path' to verify a binary, or '--fetch_entries' to pre-fetch log entries")
+		slog.Error("must specify '--payload_path' or '--payloads_path' to verify binaries, or '--fetch_entries' to pre-fetch log entries")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -301,16 +319,137 @@ func main() {
 		slog.Error("Unable to open file", "path", *payloadPath, "error", err)
 		os.Exit(1)
 	}
-	// Payload should not contain excessive leading or trailing whitespace.
-	payloadBytes := bytes.TrimSpace(b)
-	payloadBytes = append(payloadBytes, '\n')
+	payloadBytes := normalizePayload(b)
 	if string(b) != string(payloadBytes) {
 		slog.Info("Reformatted payload content", "from", b, "to", payloadBytes)
 	}
 
-	var verified bool
+	var result payloadResult
+	if err := verifyPayloads(ctx, targets, [][]byte{payloadBytes}, func(r payloadResult) { result = r }); err != nil {
+		slog.Error("FAILURE: verification interrupted", "error", err)
+		os.Exit(1)
+	}
+	switch {
+	case result.Verified:
+		slog.Info("OK. inclusion check success!", "log", result.Log)
+	case result.Error != "":
+		slog.Error("FAILURE: " + result.Error)
+		os.Exit(1)
+	default:
+		slog.Error("FAILURE: payload not verified in any log")
+		os.Exit(1)
+	}
+}
+
+// normalizePayload trims excessive leading or trailing whitespace from a
+// payload and terminates it with a single newline, as it appears in the logs.
+func normalizePayload(b []byte) []byte {
+	p := append([]byte(nil), bytes.TrimSpace(b)...)
+	return append(p, '\n')
+}
+
+// payloadResult is the outcome for one payload; in --payloads_path mode it is
+// written to stdout as one JSON line.
+type payloadResult struct {
+	// Index is the payload's 0-based record number in the input.
+	Index int `json:"index"`
+	// Verified is true if the payload's inclusion proof succeeded.
+	Verified bool `json:"verified"`
+	// Log names the log the payload was verified in, if Verified.
+	Log string `json:"log,omitempty"`
+	// Error is set if the payload was found in a log but could not be proven
+	// included. A payload that is simply not in any log has no error.
+	Error string `json:"error,omitempty"`
+}
+
+// readPayloads reads a JSON Lines file of {"payload": "..."} objects. Blank
+// lines are ignored, as are unknown fields.
+func readPayloads(r io.Reader) ([][]byte, error) {
+	var payloads [][]byte
+	dec := json.NewDecoder(r)
+	for {
+		var rec struct {
+			Payload *string `json:"payload"`
+		}
+		if err := dec.Decode(&rec); err == io.EOF {
+			return payloads, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("record %d: %w", len(payloads), err)
+		}
+		if rec.Payload == nil {
+			return nil, fmt.Errorf("record %d: missing \"payload\"", len(payloads))
+		}
+		payloads = append(payloads, normalizePayload([]byte(*rec.Payload)))
+	}
+}
+
+// runBatch verifies every payload in the JSON Lines file at path and writes
+// one payloadResult per payload to out. Results are written as soon as they
+// are known, so they are not necessarily in input order.
+//
+// Returns the process exit code: 0 once every result has been written,
+// whether or not the payloads were verified; 1 if the input cannot be read,
+// the results cannot be written, or ctx is cancelled first (in which case
+// some payloads have no result).
+func runBatch(ctx context.Context, targets []logTarget, path string, out io.Writer) int {
+	f, err := os.Open(path)
+	if err != nil {
+		slog.Error("Unable to open file", "path", path, "error", err)
+		return 1
+	}
+	payloads, err := readPayloads(f)
+	f.Close()
+	if err != nil {
+		slog.Error("Malformed payloads file", "path", path, "error", err)
+		return 1
+	}
+
+	enc := json.NewEncoder(out)
+	var writeErr error
+	verified := 0
+	err = verifyPayloads(ctx, targets, payloads, func(r payloadResult) {
+		if r.Verified {
+			verified++
+		}
+		if writeErr == nil {
+			writeErr = enc.Encode(r)
+		}
+	})
+	if err != nil {
+		slog.Error("FAILURE: verification interrupted", "error", err)
+		return 1
+	}
+	if writeErr != nil {
+		slog.Error("FAILURE: unable to write results", "error", writeErr)
+		return 1
+	}
+	slog.Info("Verified payloads", "total", len(payloads), "verified", verified)
+	return 0
+}
+
+// verifyPayloads checks each (normalized) payload against targets, in order,
+// and calls emit exactly once per payload.
+//
+// A payload's outcome is the same as verifying it alone: the first log that
+// contains it decides, and a failed proof there is final. But each checkpoint
+// is fetched, and each log searched, once for all payloads.
+//
+// If ctx is cancelled, verifyPayloads returns ctx.Err() without calling emit
+// for payloads it has not finished, rather than reporting them as not found.
+func verifyPayloads(ctx context.Context, targets []logTarget, payloads [][]byte, emit func(payloadResult)) error {
+	pending := make(map[int]bool, len(payloads))
+	for i := range payloads {
+		pending[i] = true
+	}
+
 	for _, target := range targets {
-		slog.Info("Checking log", "log", target.name, "url", target.baseURL)
+		if len(pending) == 0 {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		slog.Info("Checking log", "log", target.name, "url", target.baseURL, "payloads", len(pending))
 		root, err := checkpoint.FromURLWithPathContext(ctx, target.baseURL, target.checkpointPath, target.verifier)
 		if err != nil {
 			slog.Warn("Failed to read checkpoint", "log", target.name, "error", err)
@@ -318,71 +457,109 @@ func main() {
 		}
 
 		logSize := int64(root.Size)
-		var binaryInfoIndex int64
-		var found bool
-
-		if target.isTessera {
-			idx, ok, err := tiles.TesseraFindPayloadIndex(target.baseURL, logSize, payloadBytes)
-			if err != nil {
-				slog.Warn("Failed to search Tessera entry tiles", "log", target.name, "error", err)
-				continue
-			}
-			binaryInfoIndex = idx
-			found = ok
-		} else {
-			for _, filename := range target.binaryInfoFilenames {
-				m, err := tiles.BinaryInfosIndex(target.baseURL, filename, logSize)
-				if err != nil {
-					slog.Warn("Failed to load binary info map", "log", target.name, "file", filename, "error", err)
-					continue
-				}
-				if idx, ok := m[string(payloadBytes)]; ok {
-					binaryInfoIndex = idx
-					found = true
-					break
-				}
-			}
-		}
-
-		if !found {
-			slog.Info("Payload not found in log", "log", target.name)
-			continue
+		found := findPayloads(target, logSize, payloads, slices.Sorted(maps.Keys(pending)))
+		if missing := len(pending) - len(found); missing > 0 {
+			slog.Info("Payload not found in log", "log", target.name, "count", missing)
 		}
 
 		var th tlog.Hash
 		copy(th[:], root.Hash)
-
 		r := tiles.HashReader{
 			URL:        target.baseURL,
 			TileHeight: target.tileHeight,
 			TreeSize:   logSize,
 			IsTessera:  target.isTessera,
+			TileCache:  make(map[string][]byte),
 		}
-		slog.Debug("tlog.ProveRecord", "log", target.name, "logSize", logSize, "binaryInfoIndex", binaryInfoIndex)
-		rp, err := tlog.ProveRecord(logSize, binaryInfoIndex, r)
-		if err != nil {
-			slog.Error("error in tlog.ProveRecord", "log", target.name, "error", err)
-			os.Exit(1)
+		for _, i := range slices.Sorted(maps.Keys(found)) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			delete(pending, i)
+			emit(proveInclusion(target, r, logSize, th, i, payloads[i], found[i]))
 		}
-
-		leafHash, err := tiles.PayloadHash(payloadBytes)
-		if err != nil {
-			slog.Error("error hashing payload", "error", err)
-			os.Exit(1)
-		}
-
-		if err := tlog.CheckRecord(rp, logSize, th, binaryInfoIndex, leafHash); err != nil {
-			slog.Error("FAILURE: inclusion check error in tlog.CheckRecord", "log", target.name, "error", err)
-			os.Exit(1)
-		}
-
-		slog.Info("OK. inclusion check success!", "log", target.name)
-		verified = true
-		break
 	}
 
-	if !verified {
-		slog.Error("FAILURE: payload not verified in any log")
-		os.Exit(1)
+	// A cancelled checkpoint fetch above is only logged, so check again before
+	// declaring the remaining payloads not found.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	for _, i := range slices.Sorted(maps.Keys(pending)) {
+		emit(payloadResult{Index: i})
+	}
+	return nil
+}
+
+// findPayloads returns the leaf index in target of each payloads[i], for i in
+// indices, that the log contains.
+func findPayloads(target logTarget, logSize int64, payloads [][]byte, indices []int) map[int]int64 {
+	found := make(map[int]int64)
+	if target.isTessera {
+		wanted := make([][]byte, 0, len(indices))
+		for _, i := range indices {
+			wanted = append(wanted, payloads[i])
+		}
+		m, err := tiles.TesseraFindPayloadIndices(target.baseURL, logSize, wanted)
+		if err != nil {
+			// m still holds the exact matches found before the error; the
+			// other payloads move on to the next log, as in a single-payload
+			// run that hits the same error.
+			slog.Warn("Failed to search Tessera entry tiles", "log", target.name, "found", len(m), "error", err)
+		}
+		for _, i := range indices {
+			if idx, ok := m[string(bytes.TrimSpace(payloads[i]))]; ok {
+				found[i] = idx
+			}
+		}
+		return found
+	}
+
+	// Load each info file only if some payloads are still not found, like a
+	// single-payload run does.
+	remaining := indices
+	for _, filename := range target.binaryInfoFilenames {
+		if len(remaining) == 0 {
+			break
+		}
+		m, err := tiles.BinaryInfosIndex(target.baseURL, filename, logSize)
+		if err != nil {
+			slog.Warn("Failed to load binary info map", "log", target.name, "file", filename, "error", err)
+			continue
+		}
+		var next []int
+		for _, i := range remaining {
+			if idx, ok := m[string(payloads[i])]; ok {
+				found[i] = idx
+			} else {
+				next = append(next, i)
+			}
+		}
+		remaining = next
+	}
+	return found
+}
+
+// proveInclusion proves that payload is the leaf at leafIndex in target's tree
+// of size logSize and root hash rootHash.
+func proveInclusion(target logTarget, r tiles.HashReader, logSize int64, rootHash tlog.Hash, index int, payload []byte, leafIndex int64) payloadResult {
+	result := payloadResult{Index: index}
+	slog.Debug("tlog.ProveRecord", "log", target.name, "logSize", logSize, "binaryInfoIndex", leafIndex)
+	rp, err := tlog.ProveRecord(logSize, leafIndex, r)
+	if err != nil {
+		result.Error = fmt.Sprintf("error in tlog.ProveRecord for log %s: %v", target.name, err)
+		return result
+	}
+	leafHash, err := tiles.PayloadHash(payload)
+	if err != nil {
+		result.Error = fmt.Sprintf("error hashing payload: %v", err)
+		return result
+	}
+	if err := tlog.CheckRecord(rp, logSize, rootHash, leafIndex, leafHash); err != nil {
+		result.Error = fmt.Sprintf("inclusion check error in tlog.CheckRecord for log %s: %v", target.name, err)
+		return result
+	}
+	result.Verified = true
+	result.Log = target.name
+	return result
 }
