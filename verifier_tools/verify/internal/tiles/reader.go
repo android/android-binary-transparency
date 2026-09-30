@@ -31,6 +31,10 @@ type HashReader struct {
 	TileHeight int
 	TreeSize   int64
 	IsTessera  bool
+	// TileCache, if non-nil, keeps downloaded hash tiles (path -> content)
+	// across ReadHashes calls, e.g. for several proofs against the same tree.
+	// Not safe for concurrent use. If nil, tiles are kept for one call only.
+	TileCache map[string][]byte
 }
 
 // Domain separation prefix for Merkle tree hashing with second preimage
@@ -42,7 +46,10 @@ const (
 // ReadHashes implements tlog.HashReader's ReadHashes.
 // See: https://pkg.go.dev/golang.org/x/mod/sumdb/tlog#HashReader.
 func (h HashReader) ReadHashes(indices []int64) ([]tlog.Hash, error) {
-	tiles := make(map[string][]byte) // cache tile path -> content
+	tiles := h.TileCache // cache tile path -> content
+	if tiles == nil {
+		tiles = make(map[string][]byte)
+	}
 	hashes := make([]tlog.Hash, 0, len(indices))
 	for _, index := range indices {
 		// A tlog index is a pointer to a hash at a given level in the tree.
@@ -595,16 +602,48 @@ func FetchAllTesseraEntries(ctx context.Context, logBaseURL string, treeSize int
 // in the log. It returns the highest index if the payload appears more than once.
 // Returns (index, true, nil) if found, (-1, false, nil) if not found.
 func TesseraFindPayloadIndex(logBaseURL string, treeSize int64, targetPayload []byte) (int64, bool, error) {
-	if treeSize <= 0 {
+	found, err := TesseraFindPayloadIndices(logBaseURL, treeSize, [][]byte{targetPayload})
+	if err != nil {
+		return -1, false, err
+	}
+	idx, ok := found[string(bytes.TrimSpace(targetPayload))]
+	if !ok {
 		return -1, false, nil
+	}
+	return idx, true, nil
+}
+
+// TesseraFindPayloadIndices searches the entry tiles once for several
+// payloads. It returns a map from each found payload, with surrounding
+// whitespace trimmed, to its highest index in the log; payloads that are not
+// found are absent.
+//
+// Tiles are read from latest to oldest, as in TesseraFindPayloadIndex, and
+// the search stops as soon as every payload has been found. A payload that is
+// not in the log therefore makes the search read every tile, but only once for
+// all payloads.
+//
+// If a tile cannot be read, the search stops and returns the payloads found
+// so far together with the error. Those matches are still exact: they were
+// found in newer tiles, so a search for one payload alone would have stopped
+// there too, without reaching the failing tile. Only the payloads not yet
+// found are affected, as they would be when searched for alone.
+func TesseraFindPayloadIndices(logBaseURL string, treeSize int64, targetPayloads [][]byte) (map[string]int64, error) {
+	found := make(map[string]int64)
+	wanted := make(map[string]bool, len(targetPayloads))
+	for _, p := range targetPayloads {
+		wanted[string(bytes.TrimSpace(p))] = true
+	}
+	if treeSize <= 0 || len(wanted) == 0 {
+		return found, nil
 	}
 
 	numTiles := (treeSize + 255) / 256
-	target := bytes.TrimSpace(targetPayload)
 
 	// Search in reverse (latest to oldest) to find recent packages with typically
-	// fewer HTTP requests on cold caches.
-	for tileN := numTiles - 1; tileN >= 0; tileN-- {
+	// fewer HTTP requests on cold caches. The first match seen for a payload is
+	// therefore its highest index.
+	for tileN := numTiles - 1; tileN >= 0 && len(found) < len(wanted); tileN-- {
 		w := 256
 		if (tileN+1)*256 > treeSize {
 			w = int(treeSize - tileN*256)
@@ -612,20 +651,24 @@ func TesseraFindPayloadIndex(logBaseURL string, treeSize int64, targetPayload []
 
 		b, err := readCachedEntryTile(logBaseURL, tileN, w)
 		if err != nil {
-			return -1, false, fmt.Errorf("failed to fetch entry tile %d (width %d): %w", tileN, w, err)
+			return found, fmt.Errorf("failed to fetch entry tile %d (width %d): %w", tileN, w, err)
 		}
 
 		entries, err := ParseEntryBundle(b)
 		if err != nil {
-			return -1, false, fmt.Errorf("failed to parse entry tile %d: %w", tileN, err)
+			return found, fmt.Errorf("failed to parse entry tile %d: %w", tileN, err)
 		}
 
 		for idx := len(entries) - 1; idx >= 0; idx-- {
-			if bytes.Equal(bytes.TrimSpace(entries[idx]), target) {
-				return tileN*256 + int64(idx), true, nil
+			key := string(bytes.TrimSpace(entries[idx]))
+			if !wanted[key] {
+				continue
+			}
+			if _, seen := found[key]; !seen {
+				found[key] = tileN*256 + int64(idx)
 			}
 		}
 	}
 
-	return -1, false, nil
+	return found, nil
 }

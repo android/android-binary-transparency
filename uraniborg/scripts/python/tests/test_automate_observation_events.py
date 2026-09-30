@@ -36,6 +36,7 @@ SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, SCRIPT_DIR)
 
 import automate_observation
+import termination
 # Shared fixture and helpers for driving main() with every collaborator mocked.
 from test_automate_observation import _make_mock_device  # pylint: disable=g-importing-member
 from test_automate_observation import _set_argv  # pylint: disable=g-importing-member
@@ -151,6 +152,69 @@ def test_step_reports_finished_when_body_continues_a_loop():
       continue
   assert [(e["step"], e["state"]) for e in _parse(stream)] == [
       ("loop", "started"), ("loop", "failed")]
+
+
+class _FakeMonotonic:
+
+  def __init__(self):
+    self.now = 100.0
+
+  def __call__(self):
+    return self.now
+
+
+def _progress(events: list[dict]) -> list[tuple[int, int]]:
+  return [(e["done"], e["total"]) for e in _of_type(events, "step_progress")]
+
+
+def test_progress_reporter_event_shape():
+  stream = io.StringIO()
+  emitter = EventEmitter(stream, clock=lambda: _FIXED_TIME)
+  emitter.progress_reporter("inclusion_proof_check", "D1")(0, 5)
+  emitter.progress_reporter("other_step")(0, 2)
+  assert _parse(stream) == [
+      {"v": 1, "ts": "2026-01-02T03:04:05.678Z", "type": "step_progress",
+       "step": "inclusion_proof_check", "device": "D1", "done": 0,
+       "total": 5},
+      {"v": 1, "ts": "2026-01-02T03:04:05.678Z", "type": "step_progress",
+       "step": "other_step", "done": 0, "total": 2},
+  ]
+
+
+def test_progress_reporter_throttles_but_reports_first_and_last():
+  stream = io.StringIO()
+  clock = _FakeMonotonic()
+  emitter = EventEmitter(stream, clock=lambda: _FIXED_TIME, monotonic=clock)
+  report = emitter.progress_reporter("s", "D1", interval=2.0)
+
+  report(0, 10)       # first: reported
+  report(1, 10)       # too soon
+  clock.now += 1.9
+  report(2, 10)       # still too soon
+  clock.now += 0.1
+  report(3, 10)       # 2 s after the last event: reported
+  report(4, 10)       # too soon
+  clock.now += 5
+  report(5, 10)       # reported
+  report(5, 10)       # same done again: never reported
+  report(10, 10)      # last: always reported, even right away
+  clock.now += 5
+  report(10, 10)      # repeat of the last: not reported
+
+  assert _progress(_parse(stream)) == [(0, 10), (3, 10), (5, 10), (10, 10)]
+
+
+def test_progress_reporter_empty_step_reports_once():
+  stream = io.StringIO()
+  report = _emitter(stream).progress_reporter("s")
+  report(0, 0)
+  assert _progress(_parse(stream)) == [(0, 0)]
+
+
+def test_progress_reporter_without_stream_is_a_noop():
+  report = EventEmitter().progress_reporter("s", "D1")
+  report(0, 3)
+  report(3, 3)  # must not raise
 
 
 def test_finish_run_is_emitted_once_with_ok_semantics():
@@ -368,6 +432,52 @@ def test_main_events_inclusion_proof_outcomes(
     assert finished["error"] == {
         "reason": "inclusion_proof_check_incomplete",
         "message": "Inclusion proof check could not complete."}
+
+
+def test_main_events_inclusion_proof_progress_inside_step(
+    serial_main_mocks, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+  m = serial_main_mocks
+  m["AdbWrapper"].devices.return_value = [_make_mock_device("DEV1")]
+  events_path = tmp_path / "events.jsonl"
+  _set_argv(monkeypatch, "--events", str(events_path),
+            "--perform_inclusion_proof_check", "--verifier_path=/v",
+            "--no_prefetch")
+  clock = _FakeMonotonic()
+  real_emitter = automate_observation.EventEmitter
+
+  def emitter_with_fake_clock(*args, **kwargs):
+    return real_emitter(*args, monotonic=clock, **kwargs)
+
+  def fake_check(*args, progress, **kwargs):
+    for done in range(5):
+      progress(done, 4)
+      clock.now += 1.5  # 1.5 s per split: every other one is reported
+    return True
+
+  with mock.patch("automate_observation.os.path.isfile", return_value=True), \
+       mock.patch("automate_observation.EventEmitter",
+                  side_effect=emitter_with_fake_clock), \
+       mock.patch("inclusion_proof_check.perform_inclusion_proof_check",
+                  side_effect=fake_check):
+    automate_observation.main()
+
+  events = _read_events(events_path)
+  check = [i for i, e in enumerate(events)
+           if e.get("step") == "inclusion_proof_check"]
+  started, finished = check[0], check[-1]
+  assert events[started]["type"] == "step"
+  assert events[started]["state"] == "started"
+  progress = events[started + 1:finished]
+  assert [(e["type"], e["step"], e["device"], e["done"], e["total"])
+          for e in progress] == [
+              ("step_progress", "inclusion_proof_check", "DEV1", 0, 4),
+              ("step_progress", "inclusion_proof_check", "DEV1", 2, 4),
+              ("step_progress", "inclusion_proof_check", "DEV1", 4, 4),
+          ]
+  assert events[finished]["state"] == "finished"
+  # No progress events outside the step.
+  assert len(_of_type(events, "step_progress")) == 3
 
 
 def test_main_events_check_preinstalled_only_missing_file(
@@ -675,7 +785,7 @@ def test_main_sigterm_handler_only_installed_with_events(
   _set_argv(monkeypatch, "--events", str(tmp_path / "events.jsonl"))
   automate_observation.main()
 
-  assert seen == [before, automate_observation._raise_terminated]
+  assert seen == [before, termination.raise_terminated]
   assert signal.getsignal(signal.SIGTERM) == before
 
 
@@ -684,12 +794,12 @@ def test_main_events_terminated_in_process(
 ):
   """Terminated -> run_finished{terminated}, then die by SIGTERM (patched)."""
   m = serial_main_mocks
-  _two_devices_interrupted_on_second(m, automate_observation.Terminated())
+  _two_devices_interrupted_on_second(m, termination.Terminated())
   events_path = tmp_path / "events.jsonl"
   _set_argv(monkeypatch, "--events", str(events_path))
   before = signal.getsignal(signal.SIGTERM)
 
-  with mock.patch("automate_observation._die_by_sigterm") as die:
+  with mock.patch("termination.die_by_sigterm") as die:
     automate_observation.main()
   die.assert_called_once_with(mock.ANY)
   assert signal.getsignal(signal.SIGTERM) == before
@@ -902,7 +1012,7 @@ def test_prompt_outcome_set_by_body(body, expected_outcome):
     "exc, expected_outcome",
     [
         (KeyboardInterrupt(), "interrupted"),
-        (automate_observation.Terminated(), "terminated"),
+        (termination.Terminated(), "terminated"),
         (RuntimeError("boom"), "unexpected_error"),
     ],
     ids=["ctrl_c", "sigterm", "exception"],

@@ -100,6 +100,7 @@ Optional fields are left out rather than set to `null`.
 | :--- | :--- | :--- |
 | `run_started` | `argv` (arguments, without the script name), `pid` | First event of every run |
 | `step` | `step`, `state` (`started` / `finished` / `failed`), `device`\*, `duration_ms`\*\*, `message`\* | Around each phase (see below) |
+| `step_progress` | `step`, `device`\*, `done`, `total` | Between a step's `started` and its `finished` / `failed`, for long steps (see [Step progress](#step-progress)) |
 | `devices` | `devices` (list of `{serial, unauthorized, model?, product?, device?}`), `selected` (serials to observe), `missing` (requested via `--serial` but not connected) | Once, after listing devices |
 | `device_started` | `device` | Before processing each selected device |
 | `prompt` | `device`, `kind`, `message`, `expects_input` | The script is waiting for a person (see [Manual intervention](#manual-intervention)) |
@@ -122,6 +123,35 @@ with `--perform_inclusion_proof_check`, `inclusion_proof_prefetch` (only when
 pre-fetching is attempted) and `inclusion_proof_check`. A failed
 `inclusion_proof_prefetch` is not fatal: verification falls back to fetching
 entries on demand.
+
+#### Step progress
+
+Some steps take minutes. While they run, `step_progress` events report how far
+they have got, e.g. to show "120 of 314 checked". Currently only
+`inclusion_proof_check` reports progress: `done` is the number of APK splits
+verified so far (found in the log or not) and `total` the number of splits to
+verify (splits skipped for missing fields are not counted).
+
+- Each event carries the same `step` and `device` as the step it belongs to,
+  and appears only between that step's `started` and `finished` / `failed`.
+- The first event has `done` = `0`, once verification starts. For
+  `inclusion_proof_check`, that is after the package list has been read; if it
+  cannot be read, the step fails without any `step_progress`.
+- `done` only increases, and `total` stays the same within a step.
+- Events are throttled: at most one every 2 seconds, plus the first one and the
+  one where `done` reaches `total`, which is always sent. A step with nothing
+  to verify sends a single event with `done` = `total` = `0`.
+- A step that is stopped early (Ctrl-C, `SIGTERM`, an error) ends with
+  `failed` without reaching `done` = `total`.
+
+```json
+{"v": 1, "ts": "2026-01-02T03:05:00.000Z", "type": "step", "step": "inclusion_proof_check", "state": "started", "device": "ABCDEF012345"}
+{"v": 1, "ts": "2026-01-02T03:05:00.010Z", "type": "step_progress", "step": "inclusion_proof_check", "device": "ABCDEF012345", "done": 0, "total": 314}
+{"v": 1, "ts": "2026-01-02T03:05:02.020Z", "type": "step_progress", "step": "inclusion_proof_check", "device": "ABCDEF012345", "done": 11, "total": 314}
+...
+{"v": 1, "ts": "2026-01-02T03:05:55.400Z", "type": "step_progress", "step": "inclusion_proof_check", "device": "ABCDEF012345", "done": 314, "total": 314}
+{"v": 1, "ts": "2026-01-02T03:05:55.410Z", "type": "step", "step": "inclusion_proof_check", "state": "finished", "device": "ABCDEF012345", "duration_ms": 55410}
+```
 
 #### Manual intervention
 
@@ -293,6 +323,30 @@ flags:
 * `--check_preinstalled_only`: Performs inclusion proof checks against
   `preinstalled_packages.txt` instead of `packages.txt`, writing results to
   `preinstalled_packages_with_inclusion_proof_signal.txt`.
+
+### Batch Verification
+All APK splits are verified by a single `verifier` run in batch mode
+(`--payloads_path`, see the [verifier README](../../verifier_tools/verify/README.md)).
+It fetches each log's checkpoint, and searches the log, once for all splits.
+This keeps a cold cache (e.g. with `--no_prefetch`, or after pre-fetching
+failed) from being filled by many verifiers downloading the same files at
+once. Results are reported as the verifier finds them.
+
+With a `verifier` built before batch mode existed, or for any splits a batch
+run gives no result for (e.g. if it crashes), each split is verified by a
+`verifier` run of its own instead, one at a time. That is much slower, so a
+warning suggests rebuilding the `verifier`. The results file is the same
+either way, including the order of packages and splits.
+
+Log lines about individual splits (shown with `-D`) start with the package and
+split they are about, e.g. `com.android.chrome [config.en]: ...`.
+
+Ctrl-C stops the running verifier and starts no new ones. `SIGTERM` does the
+same when `--events` is given (and always for `inclusion_proof_check.py`).
+Without `--events`, `automate_observation.py` keeps the default `SIGTERM`
+behaviour: the script exits at once, and a verifier that was already running
+stops on its own: a per-split verifier after its split (about a second or
+two), a batch verifier when it next tries to write a result.
 
 ### Pulling Pre-installed APKs Only
 By default, `--pull-all-apks` downloads all packages listed in `packages.txt`.

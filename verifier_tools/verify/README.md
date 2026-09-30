@@ -51,6 +51,26 @@ where `log_type` is one of the following:
   * `google_1p_apk` (for Google Product Applications)
   * `mainline_module` (for Android Mainline Modules)
 
+### Batch Verification Mode
+
+To verify many candidate binaries in one run:
+```
+$ ./verifier --payloads_path=${PAYLOADS_PATH} --log_type=<log_type> [--cache_dir=<path>]
+```
+The input is a [JSON Lines](https://jsonlines.org/) file with one payload per line:
+```
+{"payload": "<hash>\n<hash_description>\n<package_name>\n<package_version_code>\n"}
+```
+Each payload gets the same result as a separate `--payload_path` run, but each log's checkpoint is fetched, and its entries searched, only once for all of them. This is much faster than one run per payload, especially on a cold cache.
+
+One JSON result per payload is written to stdout, as soon as it is known (so not necessarily in input order). `index` is the payload's 0-based record number in the input: the first `{"payload": ...}` record is `0`, the next `1`, and so on (blank lines do not count):
+```
+{"index":0,"verified":true,"log":"google_1p_apk (2026/02 Tessera)"}
+{"index":2,"verified":false,"error":"inclusion check error in tlog.CheckRecord ..."}
+{"index":1,"verified":false}
+```
+`error` is set if a payload was found in a log but its inclusion proof failed; a payload that is in no log has neither `log` nor `error`. The exit code is 0 once every result has been written, whether or not the payloads verified, and 1 if the input cannot be read or the run is interrupted (in which case some payloads have no result).
+
 ### Pre-fetching & Offline Cache Mode
 
 To pre-fetch and locally cache all entry tiles or legacy info files up to the current checkpoint (without requiring a payload or running an inclusion proof):
@@ -69,6 +89,7 @@ This enables:
 | --- | --- | --- |
 | `--log_type`, `--log-type` | Target transparency log (`pixel`, `google_1p_code`, `google_1p_apk`, `mainline_module`). Required. | `""` |
 | `--payload_path`, `--payload-path` | Path to the payload file describing the candidate binary. Required for verification mode. | `""` |
+| `--payloads_path`, `--payloads-path` | Path to a JSON Lines file of payloads. Required for batch verification mode; cannot be combined with `--payload_path`. | `""` |
 | `--fetch_entries`, `--fetch-entries` | Pre-fetch and cache all log entries locally up to the latest checkpoint. | `false` |
 | `--concurrency` | Number of concurrent workers for fetching Tessera entry tiles. | `16` |
 | `--cache_dir`, `--cache-dir` | Custom root directory for local cache. If unspecified, defaults to system cache. | OS user cache dir |
