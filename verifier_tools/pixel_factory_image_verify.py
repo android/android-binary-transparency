@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright 2019, The Android Open Source Project
 #
@@ -37,7 +37,7 @@ https://developers.google.com/android/images
 Supported: all factory images of Pixel 6 and later devices.
 
 In order for the tool to run correct the following utilities need to be
-pre-installed: grep, wget or curl, unzip.
+pre-installed: wget or curl, unzip.
 
 Additionally, make sure that the bootloader unpacker script is separately
 downloaded, made executable, and symlinked as 'fbpacktool', and made accessible
@@ -47,15 +47,71 @@ The tool also runs outside of the repository location as long as the working
 directory is writable.
 """
 
-from __future__ import print_function
-
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import distutils.spawn
+
+_GENERIC_SYSTEM_FINGERPRINT_PREFIX = 'google/generic_system_google/generic:'
+_FINGERPRINT_VALUE_PATTERN = rb'(google/[^\s\x00]+?/release-keys)'
+_SYSTEM_FINGERPRINT_PATTERN = re.compile(
+    rb'ro\.(?:system\.)?build\.fingerprint=' + _FINGERPRINT_VALUE_PATTERN
+)
+_PRODUCT_FINGERPRINT_PATTERN = re.compile(
+    rb'ro\.product\.build\.fingerprint=' + _FINGERPRINT_VALUE_PATTERN
+)
+_VENDOR_FINGERPRINT_PATTERN = re.compile(
+    rb'ro\.vendor\.build\.fingerprint=' + _FINGERPRINT_VALUE_PATTERN
+)
+_AVB_FINGERPRINT_IMAGE_FILES = (
+    'vbmeta.img',
+    'vbmeta_system.img',
+    'product.img',
+    'vbmeta_vendor.img',
+    'vendor.img',
+)
+_AVB_FINGERPRINT_PROP_PATTERN = re.compile(
+    r'Prop:\s+com\.android\.build\.(system|product|vendor)\.fingerprint'
+    r"\s+->\s+'(google/[^\s\x00']+?/release-keys)'",
+    re.ASCII,
+)
+# Bytes read per chunk and trailing overlap carried between chunks when scanning
+# partition images so a fingerprint split across two chunks is still matched.
+_SCAN_CHUNK_SIZE = 16 * 1024 * 1024  # 16 MiB
+_SCAN_OVERLAP = 4096
+
+
+def _scan_partition_fingerprint(
+    partition_path,
+    pattern=_SYSTEM_FINGERPRINT_PATTERN,
+    stop_on_generic=True,
+    chunk_size=_SCAN_CHUNK_SIZE,
+    scan_overlap=_SCAN_OVERLAP,
+):
+  """Returns the first non-generic fingerprint in partition_path, or None."""
+  if not os.path.isfile(partition_path):
+    return None
+  tail = b''
+  with open(partition_path, 'rb') as f:
+    while True:
+      chunk = f.read(chunk_size)
+      if not chunk:
+        break
+      window = tail + chunk
+      for match in pattern.finditer(window):
+        try:
+          candidate = match.group(1).decode('utf-8')
+        except UnicodeDecodeError:
+          continue
+        if not candidate.startswith(_GENERIC_SYSTEM_FINGERPRINT_PREFIX):
+          return candidate
+        if stop_on_generic:
+          return None
+      tail = window[-scan_overlap:] if scan_overlap else b''
+  return None
 
 
 class PixelFactoryImageVerifier(object):
@@ -67,11 +123,11 @@ class PixelFactoryImageVerifier(object):
     self.working_dir = os.getcwd()
     self.script_path = os.path.realpath(__file__)
     self.script_dir = os.path.split(self.script_path)[0]
-    self.avbtool_path = os.path.abspath(os.path.join(self.script_path,
+    self.avbtool_path = os.path.abspath(os.path.join(self.script_dir,
                                                      '../avb/avbtool.py'))
-    self.fw_unpacker_path = distutils.spawn.find_executable('fbpacktool')
-    self.wget_path = distutils.spawn.find_executable('wget')
-    self.curl_path = distutils.spawn.find_executable('curl')
+    self.fw_unpacker_path = shutil.which('fbpacktool')
+    self.wget_path = shutil.which('wget')
+    self.curl_path = shutil.which('curl')
 
   def run(self, argv):
     """Command line processor.
@@ -86,10 +142,17 @@ class PixelFactoryImageVerifier(object):
       sys.exit(1)
 
     # Checks if necessary commands are available.
-    for cmd in ['grep', 'unzip']:
-      if not distutils.spawn.find_executable(cmd):
+    for cmd in ['unzip']:
+      if not shutil.which(cmd):
         print(PixelFactoryImageVerifier.ERR_TOOL_UNAVAIL_FMT_STR % cmd)
         sys.exit(1)
+
+    # Checks if `avbtool.py` is available (from the `avb` git submodule).
+    if not os.path.isfile(self.avbtool_path):
+      print('Necessary tool avbtool.py not found at: %s\n'
+            'Please run "git submodule update --init --recursive" to '
+            'initialize the avb submodule.' % self.avbtool_path)
+      sys.exit(1)
 
     # Checks if `fbpacktool` is available.
     if not self.fw_unpacker_path:
@@ -317,7 +380,8 @@ class PixelFactoryImageVerifier(object):
       True if the VBMeta protected partitions verify.
     """
     os.chdir(image_dir)
-    args = [self.avbtool_path,
+    args = [sys.executable,
+            self.avbtool_path,
             'verify_image',
             '--image', 'vbmeta.img',
             '--follow_chain_partitions']
@@ -327,32 +391,120 @@ class PixelFactoryImageVerifier(object):
     os.chdir(self.working_dir)
     return result
 
+  def _extract_avb_fingerprints(self, image_dir):
+    """Extracts non-generic AVB fingerprint properties keyed by partition name.
+
+    Returns:
+      A (props, errors) tuple where props maps partition name ('system',
+      'product', 'vendor') to the first non-generic fingerprint value found,
+      and errors lists diagnostic strings for any failed avbtool invocations.
+    """
+    props = {}
+    errors = []
+    for img_name in _AVB_FINGERPRINT_IMAGE_FILES:
+      img_path = os.path.join(image_dir, img_name)
+      if not os.path.isfile(img_path):
+        continue
+      args = [sys.executable, self.avbtool_path, 'info_image', '--image',
+              img_path]
+      try:
+        result = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding='utf-8',
+            errors='replace',
+            check=False,
+        )
+      except OSError as e:
+        errors.append('  %s: %s' % (img_name, e))
+        continue
+      if result.returncode != 0:
+        stderr = result.stderr.strip()
+        detail = ' (%s)' % stderr if stderr else ''
+        errors.append(
+            '  %s: exited with code %d%s'
+            % (img_name, result.returncode, detail)
+        )
+        continue
+      for match in _AVB_FINGERPRINT_PROP_PATTERN.finditer(result.stdout):
+        prop_partition, candidate = match.group(1), match.group(2)
+        if not candidate.startswith(_GENERIC_SYSTEM_FINGERPRINT_PREFIX):
+          props.setdefault(prop_partition, candidate)
+    return props, errors
+
   def _extract_build_fingerprint(self, image_dir):
-    """Extracts the build fingerprint from the system.img.
+    """Extracts the device-specific build fingerprint from factory images.
+
+    Checks system.img first; when system.img is missing or contains the
+    Android 17+ generic system fingerprint (generic_system_google), prefers
+    signed AVB property descriptors (system, then product) via avbtool
+    info_image before falling back to scanning product.img for
+    ro.product.build.fingerprint, and finally vendor sources (with a warning).
+
     Args:
-      image_dir: The folder containing the unpacked factory image partitions,
-        which contains a vbmeta.img patition.
+      image_dir: The folder containing the unpacked factory image partitions.
 
     Returns:
       The build fingerprint string, e.g.
-      google/blueline/blueline:9/PQ2A.190305.002/5240760:user/release-keys
+      google/blueline/blueline:9/PQ2A.190305.002/5240760:user/release-keys,
+      or None if no device-specific fingerprint is found.
     """
-    os.chdir(image_dir)
-    args = ['grep',
-            '-a',
-            'ro\..*build\.fingerprint=google/.*/release-keys',
-            'system.img']
+    fingerprint = _scan_partition_fingerprint(
+        os.path.join(image_dir, 'system.img'),
+        pattern=_SYSTEM_FINGERPRINT_PATTERN,
+        stop_on_generic=True,
+    )
+    if fingerprint:
+      print('Successfully extracted build fingerprint.')
+      return fingerprint
 
-    result, output = self._run_command(
-        args,
-        'Successfully extracted build fingerprint.',
-        'Build fingerprint extraction failed.')
-    os.chdir(self.working_dir)
-    if result:
-      _, fingerprint = output.split('=', 1)
-      return fingerprint.rstrip()
-    else:
-      return None
+    avb_props, avb_errors = self._extract_avb_fingerprints(image_dir)
+    for key in ('system', 'product'):
+      fingerprint = avb_props.get(key)
+      if fingerprint:
+        print('Successfully extracted build fingerprint.')
+        return fingerprint
+
+    fingerprint = _scan_partition_fingerprint(
+        os.path.join(image_dir, 'product.img'),
+        pattern=_PRODUCT_FINGERPRINT_PATTERN,
+        stop_on_generic=False,
+    )
+    if fingerprint:
+      print('Successfully extracted build fingerprint.')
+      return fingerprint
+
+    fingerprint = avb_props.get('vendor')
+    if fingerprint:
+      print('Warning: falling back to vendor build fingerprint; '
+            'it may not match the transparency log.')
+      self._print_avb_diagnostics(avb_errors)
+      print('Successfully extracted build fingerprint.')
+      return fingerprint
+
+    fingerprint = _scan_partition_fingerprint(
+        os.path.join(image_dir, 'vendor.img'),
+        pattern=_VENDOR_FINGERPRINT_PATTERN,
+        stop_on_generic=False,
+    )
+    if fingerprint:
+      print('Warning: falling back to vendor build fingerprint; '
+            'it may not match the transparency log.')
+      self._print_avb_diagnostics(avb_errors)
+      print('Successfully extracted build fingerprint.')
+      return fingerprint
+
+    self._print_avb_diagnostics(avb_errors)
+    print('Build fingerprint extraction failed.')
+    return None
+
+  @staticmethod
+  def _print_avb_diagnostics(avb_errors):
+    if avb_errors:
+      print('avbtool info_image diagnostics:')
+      for err in avb_errors:
+        print(err)
 
   def _calculate_vbmeta_digest(self, image_dir):
     """Calculates the VBMeta Digest for given partitions using avbtool.
@@ -365,7 +517,8 @@ class PixelFactoryImageVerifier(object):
       Hex string with the VBmeta Digest value or None if it failed.
     """
     os.chdir(image_dir)
-    args = [self.avbtool_path,
+    args = [sys.executable,
+            self.avbtool_path,
             'calculate_vbmeta_digest',
             '--image', 'vbmeta.img']
     result, output = self._run_command(args,
